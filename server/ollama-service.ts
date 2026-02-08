@@ -1,159 +1,102 @@
-interface OllamaModel {
-  name: string;
-  size: number;
-  digest: string;
-  modified_at: string;
-}
+import { type Request, type Response } from "express";
 
-interface OllamaGenerateRequest {
-  model: string;
-  prompt: string;
-  system?: string;
-  stream?: boolean;
-  options?: {
-    temperature?: number;
-    num_predict?: number;
-  };
-}
+// Ollama 설정 상태 관리
+let ollamaConfig = {
+  baseUrl: "http://localhost:11434",
+  enabled: false,
+};
 
-interface OllamaGenerateResponse {
-  model: string;
-  response: string;
-  done: boolean;
-}
-
-interface OllamaChatMessage {
-  role: 'system' | 'user' | 'assistant';
-  content: string;
-}
-
-interface OllamaChatRequest {
-  model: string;
-  messages: OllamaChatMessage[];
-  stream?: boolean;
-  options?: {
-    temperature?: number;
-    num_predict?: number;
-  };
-}
-
-interface OllamaChatResponse {
-  model: string;
-  message: OllamaChatMessage;
-  done: boolean;
-}
-
-let ollamaBaseUrl = 'http://localhost:11434';
-let ollamaEnabled = false;
-
-export function setOllamaConfig(baseUrl: string, enabled: boolean) {
-  ollamaBaseUrl = baseUrl;
-  ollamaEnabled = enabled;
-}
+// 저사양 PC를 위한 추천 모델 목록
+export const RECOMMENDED_OLLAMA_MODELS = [
+  { name: "llama3.2:3b", size: "2.0GB", recommended: true },
+  { name: "gemma2:2b", size: "1.6GB", recommended: false },
+  { name: "phi3:mini", size: "2.3GB", recommended: false },
+  { name: "qwen2:1.5b", size: "1.1GB", recommended: false },
+];
 
 export function getOllamaConfig() {
-  return {
-    baseUrl: ollamaBaseUrl,
-    enabled: ollamaEnabled,
-  };
+  return ollamaConfig;
 }
 
-export function isOllamaEnabled(): boolean {
-  return ollamaEnabled;
+export function setOllamaConfig(baseUrl: string, enabled: boolean) {
+  ollamaConfig = { baseUrl, enabled };
 }
 
-export async function checkOllamaConnection(): Promise<{ connected: boolean; error?: string }> {
+export function isOllamaEnabled() {
+  return ollamaConfig.enabled;
+}
+
+// Ollama 서버 연결 상태 확인
+export async function checkOllamaConnection(): Promise<{
+  connected: boolean;
+  version?: string;
+}> {
   try {
-    const response = await fetch(`${ollamaBaseUrl}/api/tags`, {
-      method: 'GET',
-      signal: AbortSignal.timeout(5000),
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), 2000); // 2초 타임아웃
+
+    const res = await fetch(`${ollamaConfig.baseUrl}/api/version`, {
+      signal: controller.signal,
     });
-    
-    if (!response.ok) {
-      return { connected: false, error: `HTTP ${response.status}` };
+    clearTimeout(timeoutId);
+
+    if (res.ok) {
+      const data = (await res.json()) as { version: string };
+      return { connected: true, version: data.version };
     }
-    
-    return { connected: true };
-  } catch (error: any) {
-    return { 
-      connected: false, 
-      error: error.message || 'Ollama 서버에 연결할 수 없습니다' 
-    };
+    return { connected: false };
+  } catch (e) {
+    return { connected: false };
   }
 }
 
-export async function listOllamaModels(): Promise<{ models: OllamaModel[]; error?: string }> {
+// 설치된 모델 목록 조회
+export async function listOllamaModels() {
   try {
-    const response = await fetch(`${ollamaBaseUrl}/api/tags`, {
-      method: 'GET',
-      signal: AbortSignal.timeout(10000),
-    });
-    
-    if (!response.ok) {
-      return { models: [], error: `HTTP ${response.status}` };
+    // 연결 확인 없이 바로 요청 (타임아웃은 fetch 기본값 또는 브라우저/노드 설정 따름)
+    const res = await fetch(`${ollamaConfig.baseUrl}/api/tags`);
+    if (res.ok) {
+      const data = (await res.json()) as { models: any[] };
+      return { models: data.models || [] };
     }
-    
-    const data = await response.json();
-    return { models: data.models || [] };
-  } catch (error: any) {
-    return { 
-      models: [], 
-      error: error.message || 'Ollama 모델 목록을 가져올 수 없습니다' 
-    };
+    return { models: [] };
+  } catch (e) {
+    console.error("Ollama 모델 목록 조회 실패:", e);
+    return { models: [], error: "모델 목록을 가져올 수 없습니다." };
   }
 }
 
+// 텍스트 생성 (RAG용)
 export async function generateWithOllama(
   model: string,
   prompt: string,
-  systemPrompt?: string,
-  options?: { temperature?: number; maxTokens?: number }
-): Promise<{ response: string; error?: string }> {
+  systemPrompt: string,
+  options: { temperature?: number; maxTokens?: number } = {},
+) {
   try {
-    const requestBody: OllamaChatRequest = {
-      model,
-      messages: [],
-      stream: false,
-      options: {
-        temperature: options?.temperature ?? 0.2,
-        num_predict: options?.maxTokens ?? 2000,
-      },
-    };
-    
-    if (systemPrompt) {
-      requestBody.messages.push({ role: 'system', content: systemPrompt });
-    }
-    requestBody.messages.push({ role: 'user', content: prompt });
-    
-    console.log(`Ollama generating with model: ${model}`);
-    
-    const response = await fetch(`${ollamaBaseUrl}/api/chat`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(requestBody),
-      signal: AbortSignal.timeout(120000),
+    const res = await fetch(`${ollamaConfig.baseUrl}/api/generate`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        model,
+        prompt: `${prompt}`,
+        system: systemPrompt,
+        stream: false,
+        options: {
+          temperature: options.temperature,
+          num_predict: options.maxTokens,
+        },
+      }),
     });
-    
-    if (!response.ok) {
-      const errorText = await response.text();
-      return { response: '', error: `Ollama error: ${errorText}` };
+
+    if (!res.ok) {
+      throw new Error(`Ollama API 응답 오류: ${res.status}`);
     }
-    
-    const data: OllamaChatResponse = await response.json();
-    return { response: data.message?.content || '' };
-  } catch (error: any) {
-    console.error('Ollama generation error:', error);
-    return { 
-      response: '', 
-      error: error.message || 'Ollama 응답 생성 실패' 
-    };
+
+    const data = (await res.json()) as { response: string };
+    return { response: data.response };
+  } catch (e: any) {
+    console.error("Ollama 생성 오류:", e);
+    return { error: e.message || "Ollama 응답 생성 실패" };
   }
 }
-
-export const RECOMMENDED_OLLAMA_MODELS = [
-  { id: 'llama3.2:3b', name: 'Llama 3.2 3B', size: '2GB', recommended: true },
-  { id: 'gemma2:2b', name: 'Gemma 2 2B', size: '1.5GB', recommended: true },
-  { id: 'mistral:7b-instruct-q4_0', name: 'Mistral 7B Q4', size: '4GB', recommended: false },
-  { id: 'phi3:mini', name: 'Phi-3 Mini', size: '2.3GB', recommended: true },
-  { id: 'qwen2:1.5b', name: 'Qwen 2 1.5B', size: '1GB', recommended: true },
-];

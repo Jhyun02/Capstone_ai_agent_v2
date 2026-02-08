@@ -1,6 +1,7 @@
 # SQL Chatbot - 시스템 아키텍처 문서
 
 ## 목차
+
 1. [시스템 개요](#시스템-개요)
 2. [아키텍처 다이어그램](#아키텍처-다이어그램)
 3. [프론트엔드 구조](#프론트엔드-구조)
@@ -15,9 +16,11 @@
 ## 시스템 개요
 
 ### 프로젝트 설명
+
 SQL Chatbot은 자연어로 데이터베이스를 조회할 수 있는 한국어 AI 챗봇 애플리케이션입니다.
 
 ### 주요 기능
+
 - 자연어 → SQL 변환 및 실행
 - CSV 데이터 업로드 및 분석
 - 지식베이스 문서 검색 (RAG)
@@ -26,13 +29,13 @@ SQL Chatbot은 자연어로 데이터베이스를 조회할 수 있는 한국어
 
 ### 기술 스택
 
-| 영역 | 기술 |
-|------|------|
-| 프론트엔드 | React 18, TypeScript, Tailwind CSS, shadcn/ui |
-| 백엔드 | Node.js, Express.js, TypeScript |
-| 데이터베이스 | PostgreSQL (Drizzle ORM), DuckDB |
-| AI | OpenRouter API, Ollama (로컬) |
-| 빌드 | Vite, esbuild |
+| 영역         | 기술                                          |
+| ------------ | --------------------------------------------- |
+| 프론트엔드   | React 18, TypeScript, Tailwind CSS, shadcn/ui |
+| 백엔드       | Node.js, Express.js, TypeScript               |
+| 데이터베이스 | PostgreSQL (Drizzle ORM)                      |
+| AI           | OpenRouter API, Ollama (로컬)                 |
+| 빌드         | Vite, esbuild                                 |
 
 ---
 
@@ -68,25 +71,25 @@ SQL Chatbot은 자연어로 데이터베이스를 조회할 수 있는 한국어
 │  │  └─────────────┘ └─────────────┘ └─────────────┘              │   │
 │  └──────────────────────────────────────────────────────────────┘   │
 │                          │                                           │
-│  ┌───────────────┐ ┌───────────────┐ ┌───────────────────────────┐  │
-│  │  RAG Service  │ │  DuckDB      │ │  Document Parser           │  │
-│  │               │ │  Service     │ │  (PDF/DOC/PPT)             │  │
-│  └───────────────┘ └───────────────┘ └───────────────────────────┘  │
+│  ┌───────────────┐ ┌───────────────────────────┐                    │
+│  │  RAG Service  │ │  Document Parser           │                    │
+│  │ (Keyword Only)│ │  (PDF/DOC/PPT)             │                    │
+│  └───────────────┘ └───────────────────────────┘                    │
 └─────────────────────────────────────────────────────────────────────┘
-          │                    │                    │
-          │                    │                    │
-          ▼                    ▼                    ▼
-┌─────────────────┐  ┌─────────────────┐  ┌─────────────────────────┐
-│   PostgreSQL    │  │     DuckDB      │  │    AI Services          │
-│   (메인 DB)      │  │   (분석 DB)      │  │  ┌─────────────────┐    │
-│                 │  │                 │  │  │  OpenRouter     │    │
-│  - users        │  │  - analytics.   │  │  │  (클라우드)      │    │
-│  - products     │  │    duckdb       │  │  └─────────────────┘    │
-│  - sales        │  │                 │  │  ┌─────────────────┐    │
-│  - datasets     │  │  - 고성능 분석   │  │  │  Ollama         │    │
-│  - documents    │  │    쿼리         │  │  │  (로컬)          │    │
-│  - chunks       │  │                 │  │  └─────────────────┘    │
-└─────────────────┘  └─────────────────┘  └─────────────────────────┘
+          │                                         │
+          │                                         │
+          ▼                                         ▼
+┌─────────────────┐                       ┌─────────────────────────┐
+│   PostgreSQL    │                       │    AI Services          │
+│   (통합 DB)      │                       │  ┌─────────────────┐    │
+│                 │                       │  │  OpenRouter     │    │
+│  - users        │                       │  │  (클라우드)      │    │
+│  - products     │                       │  └─────────────────┘    │
+│  - sales        │                       │  ┌─────────────────┐    │
+│  - datasets     │                       │  │  Ollama         │    │
+│  - structured   │                       │  │  (로컬-Mistral)  │    │
+│  - documents    │                       │  └─────────────────┘    │
+└─────────────────┘                       └─────────────────────────┘
 ```
 
 ---
@@ -340,30 +343,30 @@ CREATE TABLE dataset_123 (
 // server/ollama-service.ts
 
 interface OllamaConfig {
-  baseUrl: string;      // default: http://localhost:11434
-  enabled: boolean;     // default: false
+  baseUrl: string; // default: http://localhost:11434
+  enabled: boolean; // default: false
 }
 
 // 주요 함수
 export function isOllamaEnabled(): boolean;
-export async function checkOllamaConnection(): Promise<{connected: boolean}>;
-export async function listOllamaModels(): Promise<{models: Model[]}>;
+export async function checkOllamaConnection(): Promise<{ connected: boolean }>;
+export async function listOllamaModels(): Promise<{ models: Model[] }>;
 export async function generateWithOllama(
   model: string,
   prompt: string,
   systemPrompt?: string,
-  options?: GenerateOptions
-): Promise<{response?: string; error?: string}>;
+  options?: GenerateOptions,
+): Promise<{ response?: string; error?: string }>;
 ```
 
 ### 추천 모델 (8GB RAM)
 
-| 모델 | 크기 | 특징 |
-|------|------|------|
-| llama3.2:3b | 2GB | 한국어 지원, 균형잡힌 성능 |
-| gemma2:2b | 1.5GB | 경량, 빠른 응답 |
-| phi3:mini | 2.3GB | 추론 능력 우수 |
-| qwen2:1.5b | 1GB | 최소 리소스 |
+| 모델        | 크기  | 특징                       |
+| ----------- | ----- | -------------------------- |
+| llama3.2:3b | 2GB   | 한국어 지원, 균형잡힌 성능 |
+| gemma2:2b   | 1.5GB | 경량, 빠른 응답            |
+| phi3:mini   | 2.3GB | 추론 능력 우수             |
+| qwen2:1.5b  | 1GB   | 최소 리소스                |
 
 ---
 
@@ -440,18 +443,22 @@ Response:
 ## 보안 고려사항
 
 ### 인증 및 세션
+
 - Express Session으로 세션 관리
 - SESSION_SECRET 환경변수 필수
 
 ### SQL 인젝션 방지
+
 - Drizzle ORM 파라미터 바인딩
 - 사용자 입력 검증
 
 ### API 키 관리
+
 - 환경변수로 API 키 저장
 - 클라이언트에 키 노출 금지
 
 ### CORS 설정
+
 - 개발환경: localhost 허용
 - 프로덕션: 특정 도메인만 허용
 

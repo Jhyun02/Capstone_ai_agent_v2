@@ -1,4 +1,15 @@
-import { pgTable, text, serial, integer, numeric, timestamp, boolean, varchar } from "drizzle-orm/pg-core";
+import {
+  pgTable,
+  text,
+  serial,
+  integer,
+  numeric,
+  timestamp,
+  boolean,
+  varchar,
+  jsonb,
+  index,
+} from "drizzle-orm/pg-core";
 import { createInsertSchema } from "drizzle-zod";
 import { z } from "zod";
 import { relations, sql } from "drizzle-orm";
@@ -8,7 +19,9 @@ export * from "./models/chat";
 
 // === USERS (Restored) ===
 export const users = pgTable("users", {
-  id: varchar("id").primaryKey().default(sql`gen_random_uuid()`),
+  id: varchar("id")
+    .primaryKey()
+    .default(sql`gen_random_uuid()`),
   username: text("username").notNull().unique(),
   password: text("password").notNull(),
 });
@@ -53,8 +66,13 @@ export const salesRelations = relations(sales, ({ one }) => ({
 
 // === SCHEMAS ===
 
-export const insertProductSchema = createInsertSchema(products).omit({ id: true });
-export const insertSaleSchema = createInsertSchema(sales).omit({ id: true, saleDate: true });
+export const insertProductSchema = createInsertSchema(products).omit({
+  id: true,
+});
+export const insertSaleSchema = createInsertSchema(sales).omit({
+  id: true,
+  saleDate: true,
+});
 
 export type Product = typeof products.$inferSelect;
 export type Sale = typeof sales.$inferSelect;
@@ -68,29 +86,46 @@ export const datasets = pgTable("datasets", {
   dataType: text("data_type").notNull(), // 'structured' or 'unstructured'
   rowCount: integer("row_count").notNull().default(0),
   columnInfo: text("column_info"), // JSON string of column metadata for structured data
-  description: text("description"),
-  duckdbTable: text("duckdb_table"), // DuckDB table name for structured data
+  description: text("description"), // JSON string of column metadata
   createdAt: timestamp("created_at").defaultNow(),
   updatedAt: timestamp("updated_at").defaultNow(),
 });
 
-// For structured data: dynamically typed columns stored as JSONB
-export const structuredData = pgTable("structured_data", {
-  id: serial("id").primaryKey(),
-  datasetId: integer("dataset_id").references(() => datasets.id, { onDelete: "cascade" }),
-  rowIndex: integer("row_index").notNull(),
-  data: text("data").notNull(), // JSON string of row data with typed values
-});
+// [정형 데이터 테이블]
+// SQL 분석용: 컬럼 구조가 있는 데이터를 JSONB로 저장하여 쿼리 가능하게 함
+export const structuredData = pgTable(
+  "structured_data",
+  {
+    id: serial("id").primaryKey(),
+    datasetId: integer("dataset_id").references(() => datasets.id, {
+      onDelete: "cascade",
+    }),
+    rowIndex: integer("row_index").notNull(),
+    data: jsonb("data").notNull(), // JSONB for efficient querying
+  },
+  (table) => ({
+    datasetIdIdx: index("structured_data_dataset_id_idx").on(table.datasetId),
+  }),
+);
 
-// For unstructured data: flexible JSONB storage with text search support
-export const unstructuredData = pgTable("unstructured_data", {
-  id: serial("id").primaryKey(),
-  datasetId: integer("dataset_id").references(() => datasets.id, { onDelete: "cascade" }),
-  rowIndex: integer("row_index").notNull(),
-  rawContent: text("raw_content"), // Original text content
-  metadata: text("metadata"), // JSON string of extracted metadata
-  searchText: text("search_text"), // Normalized text for search
-});
+// [비정형 데이터 테이블]
+// 검색/RAG용: 텍스트 원문(rawContent)과 검색용 텍스트(searchText)를 분리하여 저장
+export const unstructuredData = pgTable(
+  "unstructured_data",
+  {
+    id: serial("id").primaryKey(),
+    datasetId: integer("dataset_id").references(() => datasets.id, {
+      onDelete: "cascade",
+    }),
+    rowIndex: integer("row_index").notNull(),
+    rawContent: text("raw_content"), // Original text content
+    metadata: jsonb("metadata"), // JSONB for metadata
+    searchText: text("search_text"), // Normalized text for search
+  },
+  (table) => ({
+    datasetIdIdx: index("unstructured_data_dataset_id_idx").on(table.datasetId),
+  }),
+);
 
 export const datasetsRelations = relations(datasets, ({ many }) => ({
   structuredRows: many(structuredData),
@@ -104,20 +139,27 @@ export const structuredDataRelations = relations(structuredData, ({ one }) => ({
   }),
 }));
 
-export const unstructuredDataRelations = relations(unstructuredData, ({ one }) => ({
-  dataset: one(datasets, {
-    fields: [unstructuredData.datasetId],
-    references: [datasets.id],
+export const unstructuredDataRelations = relations(
+  unstructuredData,
+  ({ one }) => ({
+    dataset: one(datasets, {
+      fields: [unstructuredData.datasetId],
+      references: [datasets.id],
+    }),
   }),
-}));
+);
 
-export const insertDatasetSchema = createInsertSchema(datasets).omit({ 
-  id: true, 
-  createdAt: true, 
-  updatedAt: true 
+export const insertDatasetSchema = createInsertSchema(datasets).omit({
+  id: true,
+  createdAt: true,
+  updatedAt: true,
 });
-export const insertStructuredDataSchema = createInsertSchema(structuredData).omit({ id: true });
-export const insertUnstructuredDataSchema = createInsertSchema(unstructuredData).omit({ id: true });
+export const insertStructuredDataSchema = createInsertSchema(
+  structuredData,
+).omit({ id: true });
+export const insertUnstructuredDataSchema = createInsertSchema(
+  unstructuredData,
+).omit({ id: true });
 
 export type Dataset = typeof datasets.$inferSelect;
 export type InsertDataset = z.infer<typeof insertDatasetSchema>;
@@ -139,13 +181,13 @@ export interface SqlChatResponse {
 
 export interface DatasetUploadRequest {
   name: string;
-  dataType: 'structured' | 'unstructured';
+  dataType: "structured" | "unstructured";
   description?: string;
 }
 
 export interface ColumnInfo {
   name: string;
-  type: 'text' | 'number' | 'date' | 'boolean';
+  type: "text" | "number" | "date" | "boolean";
   nullable: boolean;
   sampleValues: string[];
 }
@@ -167,20 +209,33 @@ export const knowledgeDocuments = pgTable("knowledge_documents", {
   updatedAt: timestamp("updated_at").defaultNow(),
 });
 
-export const documentChunks = pgTable("document_chunks", {
-  id: serial("id").primaryKey(),
-  documentId: integer("document_id").references(() => knowledgeDocuments.id, { onDelete: "cascade" }),
-  chunkIndex: integer("chunk_index").notNull(),
-  content: text("content").notNull(),
-  pageNumber: integer("page_number"),
-  embedding: text("embedding"), // JSON array of floats (vector)
-  metadata: text("metadata"), // JSON string for extra metadata
-  createdAt: timestamp("created_at").defaultNow(),
-});
+export const documentChunks = pgTable(
+  "document_chunks",
+  {
+    id: serial("id").primaryKey(),
+    documentId: integer("document_id").references(() => knowledgeDocuments.id, {
+      onDelete: "cascade",
+    }),
+    chunkIndex: integer("chunk_index").notNull(),
+    content: text("content").notNull(),
+    pageNumber: integer("page_number"),
+    embedding: jsonb("embedding"), // JSON array of floats (vector)
+    metadata: jsonb("metadata"), // JSONB for extra metadata
+    createdAt: timestamp("created_at").defaultNow(),
+  },
+  (table) => ({
+    documentIdIdx: index("document_chunks_document_id_idx").on(
+      table.documentId,
+    ),
+  }),
+);
 
-export const knowledgeDocumentsRelations = relations(knowledgeDocuments, ({ many }) => ({
-  chunks: many(documentChunks),
-}));
+export const knowledgeDocumentsRelations = relations(
+  knowledgeDocuments,
+  ({ many }) => ({
+    chunks: many(documentChunks),
+  }),
+);
 
 export const documentChunksRelations = relations(documentChunks, ({ one }) => ({
   document: one(knowledgeDocuments, {
@@ -189,18 +244,24 @@ export const documentChunksRelations = relations(documentChunks, ({ one }) => ({
   }),
 }));
 
-export const insertKnowledgeDocumentSchema = createInsertSchema(knowledgeDocuments).omit({ 
-  id: true, 
-  createdAt: true, 
-  updatedAt: true 
+export const insertKnowledgeDocumentSchema = createInsertSchema(
+  knowledgeDocuments,
+).omit({
+  id: true,
+  createdAt: true,
+  updatedAt: true,
 });
-export const insertDocumentChunkSchema = createInsertSchema(documentChunks).omit({ 
-  id: true, 
-  createdAt: true 
+export const insertDocumentChunkSchema = createInsertSchema(
+  documentChunks,
+).omit({
+  id: true,
+  createdAt: true,
 });
 
 export type KnowledgeDocument = typeof knowledgeDocuments.$inferSelect;
-export type InsertKnowledgeDocument = z.infer<typeof insertKnowledgeDocumentSchema>;
+export type InsertKnowledgeDocument = z.infer<
+  typeof insertKnowledgeDocumentSchema
+>;
 export type DocumentChunk = typeof documentChunks.$inferSelect;
 export type InsertDocumentChunk = z.infer<typeof insertDocumentChunkSchema>;
 

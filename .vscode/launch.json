@@ -2,37 +2,12 @@
   "version": "0.2.0",
   "configurations": [
     {
-      "name": "Run Server (Development)",
+      "name": "SQL Chatbot 실행",
       "type": "node",
       "request": "launch",
-      "runtimeExecutable": "npx",
-      "runtimeArgs": ["tsx", "server/index.ts"],
-      "env": {
-        "NODE_ENV": "development",
-        "DATABASE_URL": "${env:DATABASE_URL}",
-        "AI_INTEGRATIONS_OPENROUTER_API_KEY": "${env:AI_INTEGRATIONS_OPENROUTER_API_KEY}",
-        "AI_INTEGRATIONS_OPENROUTER_BASE_URL": "https://openrouter.ai/api/v1",
-        "SESSION_SECRET": "${env:SESSION_SECRET}"
-      },
-      "console": "integratedTerminal",
-      "cwd": "${workspaceFolder}",
-      "skipFiles": ["<node_internals>/**"]
-    },
-    {
-      "name": "Debug Server",
-      "type": "node",
-      "request": "launch",
-      "runtimeExecutable": "npx",
-      "runtimeArgs": ["tsx", "--inspect", "server/index.ts"],
-      "env": {
-        "NODE_ENV": "development",
-        "DATABASE_URL": "${env:DATABASE_URL}",
-        "AI_INTEGRATIONS_OPENROUTER_API_KEY": "${env:AI_INTEGRATIONS_OPENROUTER_API_KEY}",
-        "AI_INTEGRATIONS_OPENROUTER_BASE_URL": "https://openrouter.ai/api/v1"
-      },
-      "console": "integratedTerminal",
-      "cwd": "${workspaceFolder}",
-      "skipFiles": ["<node_internals>/**"]
+      "runtimeExecutable": "npm",
+      "runtimeArgs": ["run", "dev"],
+      "console": "integratedTerminal"
     }
   ]
 }
