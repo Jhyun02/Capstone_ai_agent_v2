@@ -22,13 +22,14 @@ export type Message = {
 interface ChatOptions {
   message: string;
   useRag?: boolean;
+  datasetId?: number;
 }
 
 export function useChat() {
   return useMutation({
     mutationFn: async (options: ChatOptions) => {
-      const { message, useRag } = options;
-      
+      const { message, useRag, datasetId } = options;
+
       // Use RAG endpoint if enabled
       if (useRag) {
         const res = await fetch('/api/rag/query', {
@@ -52,7 +53,7 @@ export function useChat() {
       }
       
       // Default SQL chat
-      const input = api.chat.sql.input.parse({ message });
+      const input = api.chat.sql.input.parse({ message, datasetId });
 
       const res = await fetch(api.chat.sql.path, {
         method: api.chat.sql.method,

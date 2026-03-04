@@ -88,50 +88,7 @@ export class DatabaseStorage implements IStorage {
   }
 
   async seed() {
-    const existingProducts = await this.getProducts();
-    if (existingProducts.length === 0) {
-      console.log("Seeding database...");
-      
-      const p1 = await this.createProduct({
-        name: "Laptop Pro",
-        category: "Electronics",
-        price: "1299.99",
-        stock: 50,
-        description: "High performance laptop",
-      });
-      
-      const p2 = await this.createProduct({
-        name: "Wireless Mouse",
-        category: "Accessories",
-        price: "29.99",
-        stock: 200,
-        description: "Ergonomic wireless mouse",
-      });
-
-      const p3 = await this.createProduct({
-        name: "4K Monitor",
-        category: "Electronics",
-        price: "399.99",
-        stock: 30,
-        description: "32-inch 4K display",
-      });
-
-      const p4 = await this.createProduct({
-        name: "Office Chair",
-        category: "Furniture",
-        price: "199.99",
-        stock: 15,
-        description: "Comfortable mesh chair",
-      });
-
-      // Add some sales
-      await this.createSale({ productId: p1.id, quantity: 1, totalPrice: "1299.99" });
-      await this.createSale({ productId: p2.id, quantity: 2, totalPrice: "59.98" });
-      await this.createSale({ productId: p3.id, quantity: 1, totalPrice: "399.99" });
-      await this.createSale({ productId: p2.id, quantity: 1, totalPrice: "29.99" });
-      
-      console.log("Database seeded!");
-    }
+    // Default data seeding removed
   }
 }
 

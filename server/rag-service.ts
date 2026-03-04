@@ -122,7 +122,8 @@ async function keywordSearch(query: string, topK: number): Promise<RagContext> {
     )
     .where(
       and(eq(knowledgeDocuments.status, "ready"), or(...searchConditions)),
-    );
+    )
+    .limit(200); // [최적화] 검색 후보군 개수 제한 (CPU 부하 방지)
 
   if (allChunks.length === 0) {
     return { results: [], totalFound: 0 };

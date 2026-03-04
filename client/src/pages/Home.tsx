@@ -1,18 +1,21 @@
-import { useState, useRef, useEffect } from "react";
+import { useState, useRef, useEffect, useCallback } from "react";
 import { useQuery } from "@tanstack/react-query";
 import { useChat, type Message } from "@/hooks/use-chat";
+import { useChatStream } from "@/hooks/use-chat-stream";
 import { Sidebar, type Conversation } from "@/components/Sidebar";
 import { TopNav, type TabType } from "@/components/TopNav";
 import { ChatInput } from "@/components/ChatInput";
 import { SqlBlock } from "@/components/SqlBlock";
 import { DataTable } from "@/components/DataTable";
 import { DataChart, ChartToggle, canShowChart } from "@/components/DataChart";
+import { StepProgress } from "@/components/StepProgress";
 import { SettingsPage } from "@/components/SettingsPage";
 import { DatabasePage } from "@/components/DatabasePage";
 import { KnowledgeBasePage } from "@/components/KnowledgeBasePage";
 import { FileUploadDialog } from "@/components/FileUploadDialog";
 import { motion, AnimatePresence } from "framer-motion";
 import {
+  Filter,
   Bot,
   User,
   AlertCircle,
@@ -21,10 +24,12 @@ import {
   Database,
   BookOpen,
 } from "lucide-react";
+import type { Dataset } from "@shared/schema";
 
 interface SampleQuestionsResponse {
   questions: string[];
   datasetQuestions: {
+    datasetId: number;
     datasetName: string;
     questions: string[];
   }[];
@@ -40,6 +45,7 @@ interface StoredConversation {
   createdAt: string;
   updatedAt: string;
   messages: Message[];
+  datasetId?: number | null;
 }
 
 interface AppSettings {
@@ -93,10 +99,45 @@ export default function Home() {
   const [showChartForMessage, setShowChartForMessage] = useState<
     Record<string, boolean>
   >({});
+  const [selectedDatasetId, setSelectedDatasetId] = useState<number | null>(null);
+  const [conversationDatasets, setConversationDatasets] = useState<Record<string, number | null>>({});
 
   const bottomRef = useRef<HTMLDivElement>(null);
   const hasInitialized = useRef(false);
   const chatMutation = useChat();
+
+  // 폴백 함수: 스트리밍 실패 시 기존 chatMutation 사용
+  const handleFallback = useCallback((message: string, datasetId?: number) => {
+    chatMutation.mutate(
+      { message, useRag: false, datasetId: datasetId || undefined },
+      {
+        onSuccess: (data) => {
+          const responseMessage: Message = {
+            id: crypto.randomUUID(),
+            role: "assistant",
+            content: data.answer,
+            sql: data.sql,
+            data: data.data,
+            error: (data as any).error,
+            timestamp: new Date(),
+          };
+          setMessages((prev) => [...prev, responseMessage]);
+        },
+        onError: (error) => {
+          const errorMessage: Message = {
+            id: crypto.randomUUID(),
+            role: "assistant",
+            content: "죄송합니다, 요청을 처리하는 중 오류가 발생했습니다.",
+            error: error.message,
+            timestamp: new Date(),
+          };
+          setMessages((prev) => [...prev, errorMessage]);
+        },
+      },
+    );
+  }, [chatMutation]);
+
+  const stream = useChatStream({ onFallback: handleFallback });
 
   // Fetch dynamic sample questions based on uploaded datasets
   const { data: sampleQuestionsData } = useQuery<SampleQuestionsResponse>({
@@ -107,6 +148,16 @@ export default function Home() {
       return res.json();
     },
     staleTime: 30000, // Cache for 30 seconds
+  });
+
+  // Fetch datasets for selection
+  const { data: datasetsList } = useQuery<Dataset[]>({
+    queryKey: ["/api/datasets", datasetRefreshKey],
+    queryFn: async () => {
+      const res = await fetch("/api/datasets");
+      if (!res.ok) throw new Error("Failed to fetch datasets");
+      return res.json();
+    },
   });
 
   const makeWelcomeMessage = (): Message => ({
@@ -142,9 +193,16 @@ export default function Home() {
             }));
           });
 
+          const datasetMap: Record<string, number | null> = {};
+          parsed.forEach((c) => {
+            if (c.datasetId) datasetMap[c.id] = c.datasetId;
+          });
+
           setConversations(restored);
           setConversationMessages(msgMap);
+          setConversationDatasets(datasetMap);
           setActiveConversationId(restored[0].id);
+          setSelectedDatasetId(datasetMap[restored[0].id] || null);
           const firstMsgs = msgMap[restored[0].id];
           setMessages(
             firstMsgs && firstMsgs.length > 0
@@ -191,6 +249,7 @@ export default function Home() {
         createdAt: c.createdAt.toISOString(),
         updatedAt: c.updatedAt.toISOString(),
         messages: (updatedMsgMap[c.id] || []).slice(-MAX_MESSAGES).map((m) => ({
+          ...m,
           id: m.id,
           role: m.role,
           content: m.content,
@@ -199,6 +258,7 @@ export default function Home() {
           data: undefined, // Don't store data to save space
           error: m.error,
         })),
+        datasetId: conversationDatasets[c.id] || null,
       }));
 
     try {
@@ -206,7 +266,7 @@ export default function Home() {
     } catch (e) {
       localStorage.removeItem(STORAGE_KEY);
     }
-  }, [conversations, messages, activeConversationId, conversationMessages]);
+  }, [conversations, messages, activeConversationId, conversationMessages, conversationDatasets]);
 
   // Update conversation title when messages change
   useEffect(() => {
@@ -248,10 +308,10 @@ export default function Home() {
     localStorage.setItem("sqlchat_settings", JSON.stringify(settings));
   }, [settings]);
 
-  // Scroll to bottom on new messages
+  // Scroll to bottom on new messages or streaming updates
   useEffect(() => {
     bottomRef.current?.scrollIntoView({ behavior: "smooth" });
-  }, [messages, chatMutation.isPending]);
+  }, [messages, chatMutation.isPending, stream.isStreaming, stream.partialContent, stream.sql, stream.data]);
 
   function createNewConversation() {
     // Save current messages to the map before switching
@@ -278,10 +338,38 @@ export default function Home() {
     }));
     setActiveConversationId(id);
     setMessages([welcomeMsg]);
+    setSelectedDatasetId(null);
     setActiveTab("chat");
   }
 
-  const handleSend = (content: string) => {
+  // 스트리밍 완료 시 메시지로 변환하여 대화 기록에 저장
+  const prevStreamStep = useRef(stream.currentStep);
+  useEffect(() => {
+    if (prevStreamStep.current !== "done" && stream.currentStep === "done") {
+      // "---추천 질문---" 이전 텍스트만 본문으로 사용
+      let content = stream.partialContent;
+      if (content.includes("---추천 질문---")) {
+        content = content.split("---추천 질문---")[0].trim();
+      }
+
+      const responseMessage: Message = {
+        id: crypto.randomUUID(),
+        role: "assistant",
+        content: content || "결과를 확인해 주세요.",
+        sql: stream.sql,
+        data: stream.data,
+        timestamp: new Date(),
+      };
+      // suggestedQuestions를 메시지에 저장
+      (responseMessage as any).suggestedQuestions = stream.suggestedQuestions;
+
+      setMessages((prev) => [...prev, responseMessage]);
+      stream.reset();
+    }
+    prevStreamStep.current = stream.currentStep;
+  }, [stream.currentStep]);
+
+  const handleSend = (content: string, datasetId?: number) => {
     const newMessage: Message = {
       id: crypto.randomUUID(),
       role: "user",
@@ -291,34 +379,42 @@ export default function Home() {
 
     setMessages((prev) => [...prev, newMessage]);
 
-    chatMutation.mutate(
-      { message: content, useRag: settings.useRag },
-      {
-        onSuccess: (data) => {
-          const responseMessage: Message = {
-            id: crypto.randomUUID(),
-            role: "assistant",
-            content: data.answer,
-            sql: data.sql,
-            data: data.data,
-            sources: (data as any).sources,
-            error: (data as any).error,
-            timestamp: new Date(),
-          };
-          setMessages((prev) => [...prev, responseMessage]);
+    const targetDatasetId = datasetId !== undefined ? datasetId : selectedDatasetId;
+
+    if (settings.useRag) {
+      // RAG 모드는 기존 방식 유지
+      chatMutation.mutate(
+        { message: content, useRag: true, datasetId: targetDatasetId || undefined },
+        {
+          onSuccess: (data) => {
+            const responseMessage: Message = {
+              id: crypto.randomUUID(),
+              role: "assistant",
+              content: data.answer,
+              sql: data.sql,
+              data: data.data,
+              sources: (data as any).sources,
+              error: (data as any).error,
+              timestamp: new Date(),
+            };
+            setMessages((prev) => [...prev, responseMessage]);
+          },
+          onError: (error) => {
+            const errorMessage: Message = {
+              id: crypto.randomUUID(),
+              role: "assistant",
+              content: "죄송합니다, 요청을 처리하는 중 오류가 발생했습니다.",
+              error: error.message,
+              timestamp: new Date(),
+            };
+            setMessages((prev) => [...prev, errorMessage]);
+          },
         },
-        onError: (error) => {
-          const errorMessage: Message = {
-            id: crypto.randomUUID(),
-            role: "assistant",
-            content: "죄송합니다, 요청을 처리하는 중 오류가 발생했습니다.",
-            error: error.message,
-            timestamp: new Date(),
-          };
-          setMessages((prev) => [...prev, errorMessage]);
-        },
-      },
-    );
+      );
+    } else {
+      // SQL 분석 모드: 스트리밍 사용
+      stream.sendStream(content, targetDatasetId || undefined);
+    }
   };
 
   const handleSelectConversation = (id: string) => {
@@ -338,6 +434,7 @@ export default function Home() {
     if (!conv) return;
 
     setActiveConversationId(id);
+    setSelectedDatasetId(conversationDatasets[id] || null);
     const storedMessages = conversationMessages[id];
     setMessages(
       storedMessages && storedMessages.length > 0
@@ -355,6 +452,7 @@ export default function Home() {
     setConversationMessages((prev) => {
       const updated = { ...prev };
       delete updated[id];
+      // Note: conversationDatasets cleanup is optional but good practice
       return updated;
     });
 
@@ -364,6 +462,7 @@ export default function Home() {
         setMessages(
           conversationMessages[nextList[0].id] || [makeWelcomeMessage()],
         );
+        setSelectedDatasetId(conversationDatasets[nextList[0].id] || null);
       } else {
         createNewConversation();
       }
@@ -386,15 +485,23 @@ export default function Home() {
     setActiveTab("database");
   };
 
+  const handleDatasetChange = (datasetId: number | null) => {
+    setSelectedDatasetId(datasetId);
+    if (activeConversationId) {
+      setConversationDatasets(prev => ({
+        ...prev,
+        [activeConversationId]: datasetId
+      }));
+    }
+  };
+
   // Use dynamic sample queries from API, with fallback to static ones
-  const defaultQueries = [
-    "가장 비싼 상위 5개 제품을 보여줘",
-    "카테고리별 총 매출은 얼마야?",
-    "최근 7일간의 모든 판매 내역을 보여줘",
-    "재고가 20개 미만인 제품은?",
-  ];
+  const defaultQueries: string[] = [];
   const sampleQueries = sampleQuestionsData?.questions || defaultQueries;
   const datasetQueries = sampleQuestionsData?.datasetQuestions || [];
+  const filteredDatasetQueries = selectedDatasetId
+    ? datasetQueries.filter((dq) => dq.datasetId === selectedDatasetId)
+    : datasetQueries;
 
   const renderChatContent = () => (
     <div className="flex-1 flex flex-col relative h-full overflow-hidden">
@@ -539,6 +646,26 @@ export default function Home() {
                           </div>
                         </motion.div>
                       )}
+
+                      {/* 추천 질문 표시 */}
+                      {(msg as any).suggestedQuestions && (msg as any).suggestedQuestions.length > 0 && (
+                        <motion.div
+                          initial={{ opacity: 0 }}
+                          animate={{ opacity: 1 }}
+                          transition={{ delay: 0.3 }}
+                          className="flex flex-wrap gap-2 mt-3"
+                        >
+                          {(msg as any).suggestedQuestions.map((q: string, i: number) => (
+                            <button
+                              key={i}
+                              onClick={() => handleSend(q)}
+                              className="px-3 py-1.5 text-xs bg-primary/10 hover:bg-primary/20 text-primary rounded-full transition-colors border border-primary/20"
+                            >
+                              {q}
+                            </button>
+                          ))}
+                        </motion.div>
+                      )}
                     </div>
                   )}
 
@@ -558,7 +685,53 @@ export default function Home() {
             ))}
           </AnimatePresence>
 
-          {chatMutation.isPending && (
+          {/* 스트리밍 진행 중 UI */}
+          {stream.isStreaming && (
+            <motion.div
+              initial={{ opacity: 0, y: 10 }}
+              animate={{ opacity: 1, y: 0 }}
+              className="flex gap-4"
+            >
+              <div className="w-10 h-10 rounded-xl bg-gradient-to-br from-primary to-indigo-600 text-white flex items-center justify-center shadow-lg shadow-primary/20">
+                <Sparkles className="w-5 h-5 animate-pulse" />
+              </div>
+              <div className="flex flex-col gap-2 max-w-[90%] sm:max-w-[85%]">
+                <StepProgress currentStep={stream.currentStep} />
+
+                {stream.sql && (
+                  <motion.div
+                    initial={{ opacity: 0, height: 0 }}
+                    animate={{ opacity: 1, height: "auto" }}
+                    className="w-full"
+                  >
+                    <SqlBlock code={stream.sql} />
+                  </motion.div>
+                )}
+
+                {stream.data.length > 0 && (
+                  <motion.div
+                    initial={{ opacity: 0 }}
+                    animate={{ opacity: 1 }}
+                    className="w-full"
+                  >
+                    <DataTable data={stream.data} />
+                  </motion.div>
+                )}
+
+                {stream.partialContent && (
+                  <div className="px-3 sm:px-5 py-2.5 sm:py-3.5 rounded-2xl rounded-tl-none bg-card border border-border/50 shadow-sm text-sm leading-relaxed">
+                    {stream.partialContent.includes("---추천 질문---")
+                      ? stream.partialContent.split("---추천 질문---")[0]
+                      : stream.partialContent}
+                    <span className="inline-block w-2 h-4 bg-primary/60 animate-pulse ml-0.5 align-text-bottom" />
+                  </div>
+                )}
+              </div>
+            </motion.div>
+          )}
+
+          {/* RAG 모드 또는 폴백 시 기존 로딩 표시 */}
+          {chatMutation.isPending && !stream.isStreaming && (
             <motion.div
               initial={{ opacity: 0, y: 10 }}
               animate={{ opacity: 1, y: 0 }}
@@ -586,10 +759,10 @@ export default function Home() {
 
           {messages.length <= 1 && (
             <div className="space-y-6 mt-4 sm:mt-8 px-1 sm:px-4">
-              {datasetQueries.length > 0 ? (
+              {filteredDatasetQueries.length > 0 ? (
                 // Dataset-specific questions
                 <div className="space-y-4">
-                  {datasetQueries.map((ds, dsIdx) => (
+                  {filteredDatasetQueries.map((ds, dsIdx) => (
                     <div key={dsIdx} className="space-y-3">
                       <div className="flex items-center gap-2 text-sm font-medium text-primary">
                         <Database className="w-4 h-4" />
@@ -599,7 +772,10 @@ export default function Home() {
                         {ds.questions.map((query, i) => (
                           <button
                             key={i}
-                            onClick={() => handleSend(query)}
+                            onClick={() => {
+                              handleDatasetChange(ds.datasetId);
+                              handleSend(query, ds.datasetId);
+                            }}
                             className="group relative p-3 sm:p-4 rounded-xl border border-primary/30 bg-primary/5 hover:border-primary hover:bg-primary/10 hover:shadow-lg hover:shadow-primary/5 text-left transition-all duration-300"
                             data-testid={`dataset-query-${dsIdx}-${i}`}
                           >
@@ -647,7 +823,7 @@ export default function Home() {
       </div>
 
       <div className="w-full bg-background border-t border-border pt-4 pb-4 px-2 sm:px-4 z-40 shrink-0">
-        <div className="max-w-4xl mx-auto mb-2">
+        <div className="max-w-4xl mx-auto mb-2 flex flex-wrap items-center justify-between gap-2">
           <button
             onClick={() =>
               setSettings((prev) => ({ ...prev, useRag: !prev.useRag }))
@@ -672,8 +848,24 @@ export default function Home() {
             )}
             <span className="text-[10px] opacity-60">(클릭하여 전환)</span>
           </button>
+
+          <div className="flex items-center gap-2">
+            <Filter className="w-3.5 h-3.5 text-muted-foreground" />
+            <select
+              value={selectedDatasetId || ""}
+              onChange={(e) => handleDatasetChange(e.target.value ? Number(e.target.value) : null)}
+              className="h-7 text-xs rounded-md border border-input bg-background px-2 py-1 focus:outline-none focus:ring-1 focus:ring-primary"
+            >
+              <option value="" disabled>데이터셋 선택</option>
+              {datasetsList?.map((ds) => (
+                <option key={ds.id} value={ds.id}>
+                  {ds.name}
+                </option>
+              ))}
+            </select>
+          </div>
         </div>
-        <ChatInput onSend={handleSend} isLoading={chatMutation.isPending} />
+        <ChatInput onSend={handleSend} isLoading={chatMutation.isPending || stream.isStreaming} />
       </div>
     </div>
   );

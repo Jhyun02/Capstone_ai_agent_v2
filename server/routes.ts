@@ -29,6 +29,10 @@ const openai = new OpenAI({
 const MODEL = "mistralai/devstral-2512:free";
 const OLLAMA_MODEL = "mistral";
 
+// buildDynamicSchema 캐시 (datasetId 기준, TTL 1분)
+const schemaCache = new Map<string, { schema: string; examples: string; cachedAt: number }>();
+const SCHEMA_CACHE_TTL = 60_000; // 1분
+
 const upload = multer({
   storage: multer.memoryStorage(),
   limits: { fileSize: 500 * 1024 * 1024 }, // 500MB limit
@@ -94,11 +98,21 @@ function analyzeColumns(headers: string[], rows: any[]): ColumnInfo[] {
   });
 }
 
-async function buildDynamicSchema(): Promise<string> {
+async function buildDynamicSchema(targetDatasetId?: number): Promise<{ schema: string; examples: string }> {
+  // 캐시 확인
+  const cacheKey = String(targetDatasetId ?? "none");
+  const cached = schemaCache.get(cacheKey);
+  if (cached && Date.now() - cached.cachedAt < SCHEMA_CACHE_TTL) {
+    return { schema: cached.schema, examples: cached.examples };
+  }
+
   let schema = ENHANCED_SCHEMA;
+  let examples = "";
 
   try {
-    const uploadedDatasets = await db.select().from(datasets);
+    const uploadedDatasets = targetDatasetId
+      ? await db.select().from(datasets).where(eq(datasets.id, targetDatasetId))
+      : []; // [최적화] 데이터셋 미선택 시 커스텀 스키마를 로드하지 않아 프롬프트 크기를 줄임
 
     if (uploadedDatasets.length > 0) {
       schema += "\n\n=== 사용자 업로드 데이터셋 ===\n";
@@ -106,9 +120,11 @@ async function buildDynamicSchema(): Promise<string> {
       for (const dataset of uploadedDatasets) {
         if (dataset.dataType === "structured" && dataset.columnInfo) {
           const columns: ColumnInfo[] = JSON.parse(dataset.columnInfo);
+          const datasetName = dataset.name;
 
           // PostgreSQL storage
-          schema += `\n[structured_data 테이블에서 dataset_id = ${dataset.id}] - ${dataset.name}\n`;
+          schema += `\n=== 데이터셋 정보 (ID: ${dataset.id}) ===\n`;
+          schema += `이름: ${dataset.name}\n`;
           schema += `설명: ${dataset.description || dataset.fileName}\n`;
           schema += "| 컬럼명 | 타입 |\n";
           schema += "|--------|------|\n";
@@ -125,9 +141,29 @@ async function buildDynamicSchema(): Promise<string> {
             schema += `| ${col.name} | ${sqlType} |\n`;
           }
 
-          schema += `\n쿼리 예시: SELECT data->>'${columns[0]?.name || "column"}' as ${columns[0]?.name || "column"} FROM structured_data WHERE dataset_id = ${dataset.id}\n`;
+          // [핵심] 현재 데이터셋에 맞춤화된 Few-Shot 예시 생성
+          examples += `\n=== 올바른 쿼리 작성 예시 (참고용) ===\n`;
+          examples += `Q: "${datasetName}의 전체 데이터 수"\n`;
+          examples += `A: SELECT COUNT(*) FROM structured_data WHERE dataset_id = ${dataset.id}\n\n`;
+
+          const textCol = columns.find(c => c.type === 'text')?.name;
+          if (textCol) {
+            examples += `Q: "${datasetName}에서 ${textCol} 컬럼에 '검색어'가 포함된 데이터"\n`;
+            examples += `A: SELECT * FROM structured_data WHERE dataset_id = ${dataset.id} AND data->>'${textCol}' LIKE '%검색어%'\n\n`;
+          }
+
+          const numCol = columns.find(c => c.type === 'number')?.name;
+          if (numCol) {
+            examples += `Q: "${datasetName}의 ${numCol} 평균"\n`;
+            examples += `A: SELECT AVG(CAST(data->>'${numCol}' AS DECIMAL)) FROM structured_data WHERE dataset_id = ${dataset.id}\n\n`;
+          }
+
+          schema += `\n[쿼리 작성 규칙]\n`;
+          schema += `1. 테이블: structured_data\n`;
+          schema += `2. 필수 조건: WHERE dataset_id = ${dataset.id} (주의: 데이터셋 이름 '${dataset.name}'이 아닌 숫자 ID ${dataset.id}를 사용해야 함)\n`;
+          schema += `3. 컬럼 접근: data->>'컬럼명' (예: data->>'${columns[0]?.name || "column"}')\n`;
+          schema += `4. 형변환: 숫자/날짜 비교 시 CAST 필수 (예: 숫자/날짜 비교 시 CAST(data->>'컬럼명' AS 타입) 사용. 타입은 NUMERIC, TIMESTAMP, DATE 중 하나여야 함)\n`;
         } else if (dataset.dataType === "unstructured") {
-          schema += `\n[unstructured_data 테이블에서 dataset_id = ${dataset.id}] - ${dataset.name}\n`;
           schema += `설명: ${dataset.description || dataset.fileName} (비정형 텍스트 데이터, 키워드 검색 지원)\n`;
           schema += "| 컬럼명 | 타입 | 설명 |\n";
           schema += "|--------|------|------|\n";
@@ -143,92 +179,23 @@ async function buildDynamicSchema(): Promise<string> {
     console.error("Error building dynamic schema:", err);
   }
 
-  return schema;
+  // 캐시 저장
+  schemaCache.set(cacheKey, { schema, examples, cachedAt: Date.now() });
+  return { schema, examples };
 }
 
 const ENHANCED_SCHEMA = `
 === 데이터베이스 스키마 (PostgreSQL) ===
 
-[products 테이블] - 제품 정보
-| 컬럼명      | 타입           | 설명                                    |
-|-------------|----------------|----------------------------------------|
-| id          | SERIAL (PK)    | 제품 고유 번호                          |
-| name        | TEXT           | 제품명 (예: "노트북", "무선 마우스")      |
-| category    | TEXT           | 카테고리 (예: "전자제품", "가전", "의류") |
-| price       | NUMERIC        | 가격 (원 단위, 숫자형 - CAST 필요 시 사용)|
-| stock       | INTEGER        | 재고 수량                               |
-| description | TEXT           | 제품 상세 설명 (NULL 가능)              |
-
-[sales 테이블] - 판매 기록
-| 컬럼명      | 타입           | 설명                                    |
-|-------------|----------------|----------------------------------------|
-| id          | SERIAL (PK)    | 판매 고유 번호                          |
-| product_id  | INTEGER (FK)   | 제품 ID (→ products.id 참조)            |
-| quantity    | INTEGER        | 판매 수량                               |
-| total_price | NUMERIC        | 총 판매액 (원 단위)                     |
-| sale_date   | TIMESTAMP      | 판매 일시 (기본값: 현재 시간)           |
-
-[관계]
-- sales.product_id → products.id (다대일 관계: 하나의 제품에 여러 판매 기록)
-
-[참고사항]
-- price, total_price는 NUMERIC 타입으로, 정렬/계산 시 CAST(price AS DECIMAL) 권장
-- 날짜 필터: sale_date >= '2024-01-01' 또는 DATE_TRUNC('month', sale_date)
-`;
-
-const FEW_SHOT_EXAMPLES = `
-=== SQL 변환 예시 ===
-
-Q: "가장 비싼 제품 5개 보여줘"
-A: SELECT * FROM products ORDER BY CAST(price AS DECIMAL) DESC LIMIT 5
-
-Q: "가장 저렴한 제품은?"
-A: SELECT * FROM products ORDER BY CAST(price AS DECIMAL) ASC LIMIT 1
-
-Q: "전자제품 카테고리 제품들"
-A: SELECT * FROM products WHERE category = '전자제품'
-
-Q: "재고가 10개 이하인 제품"
-A: SELECT * FROM products WHERE stock <= 10 ORDER BY stock ASC
-
-Q: "총 매출액은 얼마야?"
-A: SELECT SUM(CAST(total_price AS DECIMAL)) as total_sales FROM sales
-
-Q: "카테고리별 제품 수"
-A: SELECT category, COUNT(*) as product_count FROM products GROUP BY category ORDER BY product_count DESC
-
-Q: "카테고리별 평균 가격"
-A: SELECT category, ROUND(AVG(CAST(price AS DECIMAL)), 0) as avg_price FROM products GROUP BY category ORDER BY avg_price DESC
-
-Q: "가장 많이 팔린 제품 TOP 5"
-A: SELECT p.name, p.category, SUM(s.quantity) as total_sold FROM products p JOIN sales s ON p.id = s.product_id GROUP BY p.id, p.name, p.category ORDER BY total_sold DESC LIMIT 5
-
-Q: "제품별 총 매출액"
-A: SELECT p.name, SUM(CAST(s.total_price AS DECIMAL)) as revenue FROM products p JOIN sales s ON p.id = s.product_id GROUP BY p.id, p.name ORDER BY revenue DESC
-
-Q: "오늘 판매 내역"
-A: SELECT p.name, s.quantity, s.total_price, s.sale_date FROM sales s JOIN products p ON s.product_id = p.id WHERE DATE(s.sale_date) = CURRENT_DATE ORDER BY s.sale_date DESC
-
-Q: "이번 달 매출"
-A: SELECT SUM(CAST(total_price AS DECIMAL)) as monthly_sales FROM sales WHERE sale_date >= DATE_TRUNC('month', CURRENT_DATE)
-
-Q: "제품 몇 개 있어?" / "총 제품 수"
-A: SELECT COUNT(*) as total_products FROM products
-
-Q: "판매 기록 몇 건이야?"
-A: SELECT COUNT(*) as total_sales FROM sales
-
-Q: "모든 제품 보여줘"
-A: SELECT * FROM products ORDER BY id
-
-Q: "최근 판매 10건"
-A: SELECT p.name, s.quantity, s.total_price, s.sale_date FROM sales s JOIN products p ON s.product_id = p.id ORDER BY s.sale_date DESC LIMIT 10
+기본 데이터베이스에는 사전 정의된 테이블이 없습니다.
+사용자가 업로드한 데이터셋(structured_data)을 통해서만 질의가 가능합니다.
 `;
 
 async function fixSqlWithLLM(
   originalSql: string,
   errorMessage: string,
   userQuestion: string,
+  schema: string = ENHANCED_SCHEMA,
 ): Promise<string> {
   const fixPrompt = `
 You are a SQL expert. The following SQL query failed with an error. Fix it.
@@ -238,7 +205,7 @@ Failed SQL: ${originalSql}
 Error: ${errorMessage}
 
 Database Schema:
-${ENHANCED_SCHEMA}
+${schema}
 
 Rules:
 1. Output ONLY the corrected SQL query
@@ -271,6 +238,7 @@ Fixed SQL:`;
         OLLAMA_MODEL,
         fixPrompt,
         "You are a SQL expert. Output only valid PostgreSQL queries.",
+        { temperature: 0, maxTokens: 200 }, // [최적화] 수정 로직 길이 추가 단축
       );
       fixedSql = result.response || "";
     }
@@ -303,110 +271,18 @@ function cleanSql(rawSql: string): string {
 }
 
 function getFallbackSql(message: string): string {
-  const lowerMessage = message.toLowerCase();
-
-  if (
-    lowerMessage.includes("매출") ||
-    lowerMessage.includes("revenue") ||
-    lowerMessage.includes("sales")
-  ) {
-    if (
-      lowerMessage.includes("총") ||
-      lowerMessage.includes("전체") ||
-      lowerMessage.includes("total")
-    ) {
-      return "SELECT SUM(CAST(total_price AS DECIMAL)) as total_sales FROM sales";
-    }
-    return "SELECT p.name, s.quantity, s.total_price, s.sale_date FROM sales s JOIN products p ON s.product_id = p.id ORDER BY s.sale_date DESC LIMIT 10";
-  }
-
-  if (lowerMessage.includes("카테고리") || lowerMessage.includes("category")) {
-    if (lowerMessage.includes("별") || lowerMessage.includes("group")) {
-      return "SELECT category, COUNT(*) as count FROM products GROUP BY category ORDER BY count DESC";
-    }
-  }
-
-  if (
-    lowerMessage.includes("가장") ||
-    lowerMessage.includes("top") ||
-    lowerMessage.includes("best")
-  ) {
-    if (lowerMessage.includes("비싼") || lowerMessage.includes("expensive")) {
-      return "SELECT * FROM products ORDER BY CAST(price AS DECIMAL) DESC LIMIT 5";
-    }
-    if (lowerMessage.includes("저렴") || lowerMessage.includes("cheap")) {
-      return "SELECT * FROM products ORDER BY CAST(price AS DECIMAL) ASC LIMIT 5";
-    }
-    if (lowerMessage.includes("팔린") || lowerMessage.includes("sold")) {
-      return "SELECT p.name, SUM(s.quantity) as total_sold FROM products p JOIN sales s ON p.id = s.product_id GROUP BY p.id, p.name ORDER BY total_sold DESC LIMIT 5";
-    }
-  }
-
-  if (lowerMessage.includes("제품") || lowerMessage.includes("product")) {
-    if (
-      lowerMessage.includes("몇") ||
-      lowerMessage.includes("count") ||
-      lowerMessage.includes("수")
-    ) {
-      return "SELECT COUNT(*) as total_products FROM products";
-    }
-    return "SELECT * FROM products ORDER BY CAST(price AS DECIMAL) DESC LIMIT 10";
-  }
-
-  return "SELECT * FROM products ORDER BY id LIMIT 10";
+  return "";
 }
 
 export async function registerRoutes(
   httpServer: Server,
   app: Express,
 ): Promise<Server> {
-  await storage.seed();
+  // await storage.seed(); // Default data seeding disabled
 
   app.get("/api/tables", async (req, res) => {
     try {
-      const tables = [
-        {
-          name: "products",
-          description: "제품 정보 테이블",
-          columns: [
-            { name: "id", type: "SERIAL", description: "제품 고유 번호 (PK)" },
-            { name: "name", type: "TEXT", description: "제품명" },
-            { name: "category", type: "TEXT", description: "카테고리" },
-            { name: "price", type: "NUMERIC", description: "가격 (원)" },
-            { name: "stock", type: "INTEGER", description: "재고 수량" },
-            { name: "description", type: "TEXT", description: "제품 설명" },
-          ],
-          rowCount: 0,
-        },
-        {
-          name: "sales",
-          description: "판매 기록 테이블",
-          columns: [
-            { name: "id", type: "SERIAL", description: "판매 고유 번호 (PK)" },
-            {
-              name: "product_id",
-              type: "INTEGER",
-              description: "제품 ID (FK)",
-            },
-            { name: "quantity", type: "INTEGER", description: "판매 수량" },
-            { name: "total_price", type: "NUMERIC", description: "총 판매액" },
-            { name: "sale_date", type: "TIMESTAMP", description: "판매 일시" },
-          ],
-          rowCount: 0,
-        },
-      ];
-
-      const productsResult = await db.execute(
-        sql.raw("SELECT COUNT(*) as count FROM products"),
-      );
-      const salesResult = await db.execute(
-        sql.raw("SELECT COUNT(*) as count FROM sales"),
-      );
-
-      tables[0].rowCount = Number(productsResult.rows[0]?.count || 0);
-      tables[1].rowCount = Number(salesResult.rows[0]?.count || 0);
-
-      res.json(tables);
+      res.json([]);
     } catch (err) {
       console.error("Tables error:", err);
       res.status(500).json({ message: "Failed to get tables" });
@@ -415,27 +291,40 @@ export async function registerRoutes(
 
   app.post(api.chat.sql.path, async (req, res) => {
     try {
-      const { message } = api.chat.sql.input.parse(req.body);
+      const { message, datasetId } = api.chat.sql.input.parse(req.body);
 
       // Build dynamic schema including uploaded datasets
-      const dynamicSchema = await buildDynamicSchema();
+      const { schema: dynamicSchema, examples: dynamicExamples } = await buildDynamicSchema(datasetId);
 
-      const systemPrompt = `You are a PostgreSQL SQL expert assistant. Convert natural language questions (Korean or English) into valid PostgreSQL queries.
+      let systemPrompt = `You are a PostgreSQL SQL expert assistant. Convert natural language questions (Korean or English) into valid PostgreSQL queries.
 
 ${dynamicSchema}
 
-${FEW_SHOT_EXAMPLES}
+${dynamicExamples}
 
 === 규칙 ===
-1. SQL 쿼리만 출력하세요. 설명, 마크다운, 추가 텍스트 없이 순수 SQL만.
-2. 스키마의 정확한 테이블명과 컬럼명을 사용하세요.
-3. price, total_price 정렬/계산 시 CAST(column AS DECIMAL) 사용
-4. "가장", "top", "best" 요청 시 반드시 LIMIT 사용
-5. JOIN 필요 시 올바른 FK 관계 사용: sales.product_id = products.id
-6. 집계 함수 사용 시 적절한 GROUP BY 포함
+1. SQL 쿼리만 출력 (코드 블록 X)
+2. 오직 'structured_data' 테이블만 사용하세요. (sales, products 테이블 사용 금지)
+3. JOIN 사용 금지.
+4. 숫자, 날짜관련 컬럼 정렬/계산 시 CAST() 함수 필수 사용
+5. "가장", "top", "best" 요청 시 반드시 LIMIT 사용
+6. "data->>'컬럼명'" 형태로 JSONB 컬럼에 접근
+7. LIKE 검색 시: data->>'컬럼명' LIKE '%keyword%' 형태 유지
+8. 컬럼명은 반드시 스키마에 있는 명칭을 정확히 사용 (임의로 영문 변환 금지)
 `;
 
+      if (datasetId) {
+        // [핵심 변경] 데이터셋 ID가 선택된 경우, AI에게 해당 ID 사용을 강제합니다.
+        systemPrompt += `8. **필수**: 쿼리에 반드시 "WHERE dataset_id = ${datasetId}" 조건을 포함하세요. (데이터셋 이름이 아닌 숫자 ID ${datasetId}를 사용해야 합니다)\n`;
+      } else {
+        systemPrompt += `8. 사용자 업로드 데이터셋(structured_data) 질의 시:
+    - "FROM structured_data WHERE dataset_id = <dataset_id>" 형태 유지
+    - 반드시 **숫자 dataset_id** 사용 (데이터셋 이름 문자열 사용 **절대 금지**). 예: dataset_id = 42 (O), dataset_id = '잘못된이름' (X)\n`;
+      }
+
       let generatedSql = "";
+
+      console.log(`[AI] Generating SQL using: ${process.env.AI_INTEGRATIONS_OPENROUTER_API_KEY ? "OpenRouter" : "Local Ollama (" + OLLAMA_MODEL + ")"}`);
 
       if (process.env.AI_INTEGRATIONS_OPENROUTER_API_KEY) {
         const completion = await openai.chat.completions.create({
@@ -454,16 +343,39 @@ ${FEW_SHOT_EXAMPLES}
           OLLAMA_MODEL,
           message,
           systemPrompt,
+          { temperature: 0, maxTokens: 200 }, // [최적화] SQL 생성 길이 추가 단축
         );
         generatedSql = cleanSql(result.response || "");
       }
 
       console.log("Generated SQL:", generatedSql);
 
+      // [Auto-Correction] datasetId가 명시된 경우, SQL의 dataset_id 조건을 강제로 수정
+      if (datasetId && generatedSql) {
+        // dataset_id = '...' 또는 dataset_id = 123 또는 dataset_id = 이름 형태를 찾아서 올바른 ID로 교체
+        // 정규식 개선: 따옴표로 감싸진 값, 숫자, 또는 공백/구분자 전까지의 문자열을 모두 잡음
+        const idRegex = /dataset_id\s*=\s*(?:'[^']*'|"[^"]*"|\d+|[^\s,;)]+)/gi;
+        if (idRegex.test(generatedSql)) {
+          const fixedSql = generatedSql.replace(idRegex, `dataset_id = ${datasetId}`);
+          if (fixedSql !== generatedSql) {
+            console.log(`[Auto-Fix] Corrected dataset_id: ${generatedSql} -> ${fixedSql}`);
+            generatedSql = fixedSql;
+          }
+        }
+      }
+
       if (!generatedSql || !generatedSql.toLowerCase().startsWith("select")) {
         console.log("Invalid SQL, using fallback");
         generatedSql = getFallbackSql(message);
         console.log("Fallback SQL:", generatedSql);
+      }
+
+      if (!generatedSql) {
+        return res.json({
+          answer: "데이터셋을 선택하거나 업로드해주세요. 기본 데이터에 대한 질의는 지원하지 않습니다.",
+          sql: "",
+          data: [],
+        });
       }
 
       let queryResult: any[] = [];
@@ -489,6 +401,7 @@ ${FEW_SHOT_EXAMPLES}
               generatedSql,
               dbError.message,
               message,
+              dynamicSchema,
             );
 
             if (fixedSql && fixedSql !== generatedSql) {
@@ -522,9 +435,12 @@ ${FEW_SHOT_EXAMPLES}
 - 숫자가 있으면 읽기 쉽게 포맷 (예: 1000000 → 100만)
 - 데이터가 없으면 "조회된 데이터가 없습니다"라고 안내
 - SQL이나 기술 용어 사용 금지, 결과만 자연스럽게 설명
+- 답변 마지막에 "---추천 질문---"이라고 적고, 이어서 데이터 분석에 도움이 될만한 후속 질문 3가지를 줄바꿈으로 구분하여 작성해줘. (예: "카테고리별 매출 비중은?", "가장 재고가 적은 제품은?")
 `;
 
       let answer = "결과를 확인해 주세요.";
+
+      console.log(`[AI] Generating summary using: ${process.env.AI_INTEGRATIONS_OPENROUTER_API_KEY ? "OpenRouter" : "Local Ollama (" + OLLAMA_MODEL + ")"}`);
 
       if (process.env.AI_INTEGRATIONS_OPENROUTER_API_KEY) {
         const summaryCompletion = await openai.chat.completions.create({
@@ -546,14 +462,29 @@ ${FEW_SHOT_EXAMPLES}
           OLLAMA_MODEL,
           summaryPrompt,
           "당신은 친절한 데이터 분석 어시스턴트입니다. 자연스럽고 간결한 한국어로 답변하세요.",
+          { temperature: 0.2, maxTokens: 400 }, // [최적화] 요약 답변 길이 추가 단축
         );
         answer = result.response || answer;
       }
 
+      // 추천 질문 파싱
+      let finalAnswer = answer;
+      let suggestedQuestions: string[] = [];
+
+      if (answer.includes("---추천 질문---")) {
+        const parts = answer.split("---추천 질문---");
+        finalAnswer = parts[0].trim();
+        suggestedQuestions = parts[1]
+          .split("\n")
+          .map((q) => q.trim().replace(/^-\s*/, "").replace(/^\d+\.\s*/, ""))
+          .filter((q) => q.length > 0);
+      }
+
       res.json({
-        answer,
+        answer: finalAnswer,
         sql: generatedSql,
         data: queryResult,
+        suggestedQuestions,
       });
     } catch (err) {
       console.error("Chat error:", err);
@@ -562,6 +493,236 @@ ${FEW_SHOT_EXAMPLES}
       } else {
         res.status(500).json({ message: "Internal server error" });
       }
+    }
+  });
+
+  // === SSE 스트리밍 엔드포인트 ===
+  app.post("/api/sql-chat-stream", async (req, res) => {
+    // SSE 헤더 설정
+    res.writeHead(200, {
+      "Content-Type": "text/event-stream",
+      "Cache-Control": "no-cache",
+      Connection: "keep-alive",
+      "X-Accel-Buffering": "no", // nginx 버퍼링 비활성화
+    });
+
+    const sendEvent = (event: string, data: any) => {
+      res.write(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`);
+    };
+
+    // 클라이언트 연결 끊김 감지
+    const abortController = new AbortController();
+    req.on("close", () => abortController.abort());
+
+    try {
+      const { message, datasetId } = api.chat.sql.input.parse(req.body);
+
+      // 1단계: SQL 생성
+      sendEvent("step", { step: "generating_sql", label: "SQL 생성 중..." });
+
+      const { schema: dynamicSchema, examples: dynamicExamples } = await buildDynamicSchema(datasetId);
+
+      // [최적화] 영어 프롬프트로 변환 (Mistral 코드 태스크 성능 향상 + 토큰 수 30-40% 감소)
+      let systemPrompt = `You are a PostgreSQL expert. Convert natural language questions into valid PostgreSQL queries.
+
+${dynamicSchema}
+
+${dynamicExamples}
+
+Rules:
+1. Output ONLY the SQL query (no code blocks, no explanation)
+2. Use ONLY 'structured_data' table (never use sales, products)
+3. No JOINs
+4. Use CAST() for numeric/date column sorting and calculations
+5. Use LIMIT for "top", "best", "most" queries
+6. Access JSONB columns via data->>'column_name'
+7. LIKE search: data->>'col' LIKE '%keyword%'
+8. Use exact column names from schema (no translation)`;
+
+      if (datasetId) {
+        systemPrompt += `\n9. REQUIRED: Always include WHERE dataset_id = ${datasetId}`;
+      }
+
+      let generatedSql = "";
+
+      if (process.env.AI_INTEGRATIONS_OPENROUTER_API_KEY) {
+        const completion = await openai.chat.completions.create({
+          model: MODEL,
+          messages: [
+            { role: "system", content: systemPrompt },
+            { role: "user", content: message },
+          ],
+          temperature: 0,
+          max_tokens: 256,
+        });
+        generatedSql = cleanSql(completion.choices[0]?.message?.content || "");
+      } else {
+        const result = await ollamaService.generateWithOllama(
+          OLLAMA_MODEL,
+          message,
+          systemPrompt,
+          { temperature: 0, maxTokens: 200 },
+        );
+        generatedSql = cleanSql(result.response || "");
+      }
+
+      // dataset_id 자동 수정
+      if (datasetId && generatedSql) {
+        const idRegex = /dataset_id\s*=\s*(?:'[^']*'|"[^"]*"|\d+|[^\s,;)]+)/gi;
+        if (idRegex.test(generatedSql)) {
+          generatedSql = generatedSql.replace(
+            /dataset_id\s*=\s*(?:'[^']*'|"[^"]*"|\d+|[^\s,;)]+)/gi,
+            `dataset_id = ${datasetId}`,
+          );
+        }
+      }
+
+      if (!generatedSql || !generatedSql.toLowerCase().startsWith("select")) {
+        generatedSql = getFallbackSql(message);
+      }
+
+      if (!generatedSql) {
+        sendEvent("done", {
+          answer: "데이터셋을 선택하거나 업로드해주세요.",
+          sql: "",
+          data: [],
+          suggestedQuestions: [],
+        });
+        res.end();
+        return;
+      }
+
+      // SQL 전송
+      sendEvent("sql", { sql: generatedSql });
+
+      // 2단계: SQL 실행
+      sendEvent("step", { step: "executing_sql", label: "쿼리 실행 중..." });
+
+      let queryResult: any[] = [];
+      let lastError: string | null = null;
+      const MAX_RETRIES = 2;
+
+      for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
+        try {
+          const result = await db.execute(sql.raw(generatedSql));
+          queryResult = result.rows;
+          lastError = null;
+          break;
+        } catch (dbError: any) {
+          lastError = dbError.message;
+          if (attempt < MAX_RETRIES) {
+            const fixedSql = await fixSqlWithLLM(generatedSql, dbError.message, message, dynamicSchema);
+            if (fixedSql && fixedSql !== generatedSql) {
+              generatedSql = fixedSql;
+              sendEvent("sql", { sql: generatedSql }); // 수정된 SQL 재전송
+            } else {
+              generatedSql = getFallbackSql(message);
+            }
+          }
+        }
+      }
+
+      if (lastError) {
+        sendEvent("done", {
+          answer: "죄송합니다. 해당 질문에 대한 쿼리를 실행할 수 없습니다. 다른 방식으로 질문해 주시겠어요?",
+          sql: generatedSql,
+          data: [],
+          error: lastError,
+          suggestedQuestions: [],
+        });
+        res.end();
+        return;
+      }
+
+      // 데이터 전송
+      sendEvent("data", { rows: queryResult, rowCount: queryResult.length });
+
+      // 3단계: 요약 생성 (스트리밍)
+      sendEvent("step", { step: "generating_summary", label: "결과 요약 중..." });
+
+      // [최적화] 요약 프롬프트 압축: 데이터 프리뷰 5행, 지시문 간결화
+      const dataPreview = queryResult.slice(0, 5);
+      const summaryPrompt = `Question: "${message}"
+SQL: ${generatedSql}
+Data (${queryResult.length} rows): ${JSON.stringify(dataPreview)}
+
+한국어로 친절하게 답변. 숫자는 읽기 쉽게 포맷. SQL/기술 용어 금지.
+답변 후 "---추천 질문---"을 적고 후속 질문 3개 작성.`;
+
+      const summarySystem = "친절한 데이터 분석 어시스턴트. 간결한 한국어로 답변.";
+
+      if (process.env.AI_INTEGRATIONS_OPENROUTER_API_KEY) {
+        // OpenRouter는 비스트리밍 (기존 로직 유지)
+        const summaryCompletion = await openai.chat.completions.create({
+          model: MODEL,
+          messages: [
+            { role: "system", content: summarySystem },
+            { role: "user", content: summaryPrompt },
+          ],
+          max_tokens: 512,
+        });
+        const answer = summaryCompletion.choices[0]?.message?.content || "결과를 확인해 주세요.";
+
+        let finalAnswer = answer;
+        let suggestedQuestions: string[] = [];
+        if (answer.includes("---추천 질문---")) {
+          const parts = answer.split("---추천 질문---");
+          finalAnswer = parts[0].trim();
+          suggestedQuestions = parts[1]
+            .split("\n")
+            .map((q) => q.trim().replace(/^-\s*/, "").replace(/^\d+\.\s*/, ""))
+            .filter((q) => q.length > 0);
+        }
+
+        // 전체 답변을 한번에 토큰으로 전송
+        sendEvent("token", { content: finalAnswer });
+        sendEvent("done", { suggestedQuestions });
+      } else {
+        // Ollama 스트리밍
+        await new Promise<void>((resolve, reject) => {
+          let fullResponse = "";
+
+          ollamaService.generateWithOllamaStream(
+            OLLAMA_MODEL,
+            summaryPrompt,
+            summarySystem,
+            {
+              onToken: (token) => {
+                sendEvent("token", { content: token });
+              },
+              onDone: (response) => {
+                fullResponse = response;
+
+                let suggestedQuestions: string[] = [];
+                if (fullResponse.includes("---추천 질문---")) {
+                  const parts = fullResponse.split("---추천 질문---");
+                  suggestedQuestions = parts[1]
+                    .split("\n")
+                    .map((q) => q.trim().replace(/^-\s*/, "").replace(/^\d+\.\s*/, ""))
+                    .filter((q) => q.length > 0);
+                }
+
+                sendEvent("done", { suggestedQuestions });
+                resolve();
+              },
+              onError: (error) => {
+                sendEvent("error", { message: error.message });
+                resolve(); // resolve로 종료 (reject하면 outer catch에서 중복 처리)
+              },
+            },
+            { temperature: 0.2, maxTokens: 400, signal: abortController.signal },
+          );
+        });
+      }
+
+      res.end();
+    } catch (err: any) {
+      if (err.name === "AbortError") return;
+      console.error("Stream chat error:", err);
+      try {
+        sendEvent("error", { message: err.message || "Internal server error" });
+      } catch {}
+      res.end();
     }
   });
 
@@ -664,9 +825,20 @@ ${FEW_SHOT_EXAMPLES}
   });
 
   // Upload CSV file
-  app.post("/api/datasets/upload", upload.single("file"), async (req, res) => {
+  app.post("/api/datasets/upload", (req, res, next) => {
+    // Multer 미들웨어를 수동으로 호출하여 에러를 명시적으로 잡습니다.
+    upload.any()(req, res, (err) => {
+      if (err) {
+        return res.status(400).json({ message: "File upload failed: " + err.message });
+      }
+      next();
+    });
+  }, async (req, res) => {
     try {
-      if (!req.file) {
+      // req.files(배열) 또는 req.file에서 파일을 찾습니다.
+      const file = (req.files as Express.Multer.File[])?.[0] || req.file;
+
+      if (!file) {
         return res.status(400).json({ message: "No file uploaded" });
       }
 
@@ -677,9 +849,15 @@ ${FEW_SHOT_EXAMPLES}
           .json({ message: "Name and dataType are required" });
       }
 
+      console.log(`[Upload] Starting upload. Name: ${name}, Encoding: ${encoding || 'utf-8'}`);
+
       // Use TextDecoder to handle various encodings like UTF-8 and EUC-KR
       const decoder = new TextDecoder(encoding || "utf-8");
-      const csvContent = decoder.decode(req.file.buffer);
+      const csvContent = decoder.decode(file.buffer);
+      
+      // [디버깅] CSV 내용 미리보기 (한글 깨짐 확인용)
+      console.log(`[Upload] Content Preview: ${csvContent.substring(0, 50)}...`);
+
       const parsed = Papa.parse(csvContent, {
         header: true,
         skipEmptyLines: true,
@@ -703,12 +881,11 @@ ${FEW_SHOT_EXAMPLES}
         dataType === "structured" ? analyzeColumns(headers, rows) : null;
 
       // Decode file name properly for Korean/UTF-8 characters
-      let fileName = req.file.originalname;
+      let fileName = file.originalname;
       try {
         // Multer may encode non-ASCII names incorrectly, try to decode
-        fileName = Buffer.from(req.file.originalname, "latin1").toString(
-          "utf8",
-        );
+        fileName = decodeFilename(file.originalname);
+        console.log(`[Upload] Filename decoded: ${fileName}`);
       } catch {
         // Keep original if decoding fails
       }
@@ -804,28 +981,24 @@ ${FEW_SHOT_EXAMPLES}
   app.get("/api/sample-questions", async (req, res) => {
     try {
       // Base sample queries for default schema
-      const defaultQueries = [
-        "가장 비싼 상위 5개 제품을 보여줘",
-        "카테고리별 총 매출은 얼마야?",
-        "최근 7일간의 모든 판매 내역을 보여줘",
-        "재고가 20개 미만인 제품은?",
-      ];
+      const defaultQueries: string[] = [];
 
       // Fetch uploaded datasets
       const uploadedDatasets = await db
         .select()
         .from(datasets)
-        .orderBy(desc(datasets.createdAt));
+        .orderBy(desc(datasets.createdAt))
+        .limit(3); // [최적화] 최근 3개 데이터셋만 분석하여 초기 로딩 속도 향상
 
       if (uploadedDatasets.length === 0) {
         return res.json({ questions: defaultQueries, datasetQuestions: [] });
       }
 
       // Generate questions for each dataset based on its columns
-      const datasetQuestions: { datasetName: string; questions: string[] }[] =
+      const datasetQuestions: { datasetId: number; datasetName: string; questions: string[] }[] =
         [];
 
-      for (const dataset of uploadedDatasets.slice(0, 3)) {
+      for (const dataset of uploadedDatasets) {
         const datasetName = dataset.name;
         const questions: string[] = [];
 
@@ -838,7 +1011,7 @@ ${FEW_SHOT_EXAMPLES}
               .select({ content: unstructuredData.rawContent })
               .from(unstructuredData)
               .where(eq(unstructuredData.datasetId, dataset.id))
-              .limit(50); // 처음 50개 행 분석
+              .limit(10); // [최적화] 속도 개선을 위해 샘플링 개수 축소 (50 -> 10)
 
             const textContent = samples
               .map((s) => s.content)
@@ -884,37 +1057,18 @@ ${FEW_SHOT_EXAMPLES}
             // Pattern 1: Count total records (always valid)
             questions.push(`${datasetName}의 전체 데이터 수는?`);
 
-            // Pattern 2: If there are number columns with valid names, suggest aggregation
+            // Pattern 2: Simple aggregation (Sum)
             if (numberCols.length > 0) {
               const numCol = numberCols[0].name.trim();
-              questions.push(`${datasetName}에서 ${numCol}의 합계/평균은?`);
+              questions.push(`${datasetName}의 총 ${numCol} 합계는?`);
             }
 
-            // Pattern 3: If there are text columns with valid names, suggest grouping
-            if (textCols.length > 0) {
-              const textCol = textCols[0].name.trim();
-              questions.push(
-                `${datasetName}에서 ${textCol}별로 몇 건인지 보여줘`,
-              );
-            }
+            // Pattern 3: Show sample data (Simple SELECT)
+            questions.push(`${datasetName} 데이터 5개만 보여줘`);
 
-            // Pattern 4: Show sample data (always valid)
-            questions.push(`${datasetName}의 최근 10건 데이터 보여줘`);
-
-            // Pattern 5: If there are date columns with valid names, suggest filtering
-            if (dateCols.length > 0) {
-              const dateCol = dateCols[0].name.trim();
-              questions.push(
-                `${datasetName}에서 ${dateCol} 기준 최신 데이터는?`,
-              );
-            }
-
-            // Pattern 6: Search for specific values from text columns
-            if (
-              textCols.length > 0 &&
-              textCols[0].sampleValues &&
-              textCols[0].sampleValues.length > 0
-            ) {
+            // Pattern 4: Search specific value (only if sample values exist)
+            // 로컬 LLM이 WHERE 절을 잘 못 만들 수 있으므로, 가장 단순한 형태의 검색 질문만 생성
+            if (textCols.length > 0 && textCols[0].sampleValues?.length > 0) {
               const sampleValue = textCols[0].sampleValues[0];
               if (
                 sampleValue &&
@@ -938,6 +1092,7 @@ ${FEW_SHOT_EXAMPLES}
         // Only add if we have meaningful questions
         if (questions.length >= 2) {
           datasetQuestions.push({
+            datasetId: dataset.id,
             datasetName,
             questions: questions.slice(0, 4), // Limit to 4 questions per dataset
           });
@@ -958,6 +1113,7 @@ ${FEW_SHOT_EXAMPLES}
   app.delete("/api/datasets/:id", async (req, res) => {
     try {
       const id = parseInt(req.params.id);
+      console.log(`[Delete] Request received for dataset ID: ${id}`);
 
       // Get dataset to check for DuckDB table
       const [dataset] = await db
@@ -967,11 +1123,13 @@ ${FEW_SHOT_EXAMPLES}
         .limit(1);
 
       if (!dataset) {
+        console.log(`[Delete] Dataset ID ${id} not found`);
         return res.status(404).json({ message: "Dataset not found" });
       }
 
       // Delete from PostgreSQL (cascade will delete related data)
       await db.delete(datasets).where(eq(datasets.id, id));
+      console.log(`[Delete] Dataset ID ${id} deleted successfully`);
 
       res.json({ message: "Dataset deleted successfully" });
     } catch (err) {

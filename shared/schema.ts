@@ -170,6 +170,7 @@ export type UnstructuredDataRow = typeof unstructuredData.$inferSelect;
 
 export interface SqlChatRequest {
   message: string;
+  datasetId?: number;
 }
 
 export interface SqlChatResponse {
@@ -177,6 +178,7 @@ export interface SqlChatResponse {
   sql: string;
   data: any[];
   error?: string;
+  suggestedQuestions?: string[];
 }
 
 export interface DatasetUploadRequest {

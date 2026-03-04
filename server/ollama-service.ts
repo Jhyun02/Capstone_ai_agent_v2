@@ -66,7 +66,13 @@ export async function listOllamaModels() {
   }
 }
 
-// 텍스트 생성 (RAG용)
+// 최적화된 Ollama 옵션 (macOS Apple Silicon 최적화)
+const OLLAMA_OPTIMIZED_OPTIONS = {
+  num_ctx: 2048,    // 기본 8192에서 축소 → 프롬프트 평가 속도 향상
+  num_batch: 512,   // 프롬프트 병렬 평가
+};
+
+// 텍스트 생성 (RAG용, SQL 생성 등 짧은 응답용)
 export async function generateWithOllama(
   model: string,
   prompt: string,
@@ -82,9 +88,11 @@ export async function generateWithOllama(
         prompt: `${prompt}`,
         system: systemPrompt,
         stream: false,
+        keep_alive: "30m",
         options: {
           temperature: options.temperature,
           num_predict: options.maxTokens,
+          ...OLLAMA_OPTIMIZED_OPTIONS,
         },
       }),
     });
@@ -98,5 +106,86 @@ export async function generateWithOllama(
   } catch (e: any) {
     console.error("Ollama 생성 오류:", e);
     return { error: e.message || "Ollama 응답 생성 실패" };
+  }
+}
+
+// 스트리밍 텍스트 생성 (요약 등 긴 응답용)
+export async function generateWithOllamaStream(
+  model: string,
+  prompt: string,
+  systemPrompt: string,
+  callbacks: {
+    onToken: (token: string) => void;
+    onDone: (fullResponse: string) => void;
+    onError: (error: Error) => void;
+  },
+  options: { temperature?: number; maxTokens?: number; signal?: AbortSignal } = {},
+) {
+  try {
+    const res = await fetch(`${ollamaConfig.baseUrl}/api/generate`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        model,
+        prompt,
+        system: systemPrompt,
+        stream: true,
+        keep_alive: "30m",
+        options: {
+          temperature: options.temperature,
+          num_predict: options.maxTokens,
+          ...OLLAMA_OPTIMIZED_OPTIONS,
+        },
+      }),
+      signal: options.signal,
+    });
+
+    if (!res.ok) {
+      throw new Error(`Ollama API 응답 오류: ${res.status}`);
+    }
+
+    const reader = res.body?.getReader();
+    if (!reader) {
+      throw new Error("응답 스트림을 읽을 수 없습니다");
+    }
+
+    const decoder = new TextDecoder();
+    let fullResponse = "";
+    let buffer = "";
+
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+
+      buffer += decoder.decode(value, { stream: true });
+
+      // NDJSON 파싱: 줄바꿈으로 구분된 JSON 객체
+      const lines = buffer.split("\n");
+      buffer = lines.pop() || ""; // 마지막 불완전한 줄은 버퍼에 유지
+
+      for (const line of lines) {
+        if (!line.trim()) continue;
+        try {
+          const chunk = JSON.parse(line) as { response?: string; done?: boolean };
+          if (chunk.response) {
+            fullResponse += chunk.response;
+            callbacks.onToken(chunk.response);
+          }
+          if (chunk.done) {
+            callbacks.onDone(fullResponse);
+            return;
+          }
+        } catch {
+          // JSON 파싱 실패 시 무시
+        }
+      }
+    }
+
+    // 스트림이 끝났지만 done 이벤트가 없었을 경우
+    callbacks.onDone(fullResponse);
+  } catch (e: any) {
+    if (e.name === "AbortError") return; // 클라이언트 연결 끊김
+    console.error("Ollama 스트리밍 오류:", e);
+    callbacks.onError(e);
   }
 }

@@ -47,7 +47,7 @@ export function FileUploadDialog({
   const handleFileSelect = (e: React.ChangeEvent<HTMLInputElement>) => {
     const selectedFile = e.target.files?.[0];
     if (selectedFile) {
-      if (!selectedFile.name.endsWith(".csv")) {
+      if (!selectedFile.name.toLowerCase().endsWith(".csv")) {
         toast({
           variant: "destructive",
           title: "잘못된 파일 형식",
@@ -76,11 +76,12 @@ export function FileUploadDialog({
 
     try {
       const formData = new FormData();
-      formData.append("file", file);
+      // 중요: 텍스트 필드를 파일보다 먼저 추가해야 서버에서 올바르게 인식합니다.
       formData.append("name", name.trim());
       formData.append("dataType", dataType);
       formData.append("encoding", encoding);
       formData.append("anonymize", String(anonymize));
+      formData.append("file", file);
 
       const response = await fetch("/api/datasets/upload", {
         method: "POST",

@@ -7,6 +7,7 @@ export const api = {
       path: '/api/sql-chat',
       input: z.object({
         message: z.string(),
+        datasetId: z.number().optional(),
       }),
       responses: {
         200: z.object({
