@@ -1,6 +1,6 @@
 import { useState, useCallback, useRef } from "react";
 
-export type StreamStep = "generating_sql" | "executing_sql" | "generating_summary" | "idle" | "done" | "error";
+export type StreamStep = "generating_sql" | "executing_sql" | "visualizing" | "idle" | "done" | "error";
 
 export interface StreamState {
   currentStep: StreamStep;
@@ -8,9 +8,7 @@ export interface StreamState {
   sql: string;
   data: any[];
   rowCount: number;
-  partialContent: string;
   isStreaming: boolean;
-  suggestedQuestions: string[];
   error: string | null;
 }
 
@@ -20,9 +18,7 @@ const initialState: StreamState = {
   sql: "",
   data: [],
   rowCount: 0,
-  partialContent: "",
   isStreaming: false,
-  suggestedQuestions: [],
   error: null,
 };
 
@@ -51,6 +47,13 @@ export function useChatStream({ onFallback }: UseChatStreamOptions) {
       stepLabel: "SQL 생성 중...",
     });
 
+    // 90초 타임아웃: 스트리밍이 완료되지 않으면 자동 폴백
+    const streamTimeout = setTimeout(() => {
+      controller.abort();
+      setState(initialState);
+      onFallback(message, datasetId);
+    }, 90_000);
+
     try {
       const res = await fetch("/api/sql-chat-stream", {
         method: "POST",
@@ -69,7 +72,6 @@ export function useChatStream({ onFallback }: UseChatStreamOptions) {
 
       const decoder = new TextDecoder();
       let buffer = "";
-      let partialContent = "";
 
       while (true) {
         const { done, value } = await reader.read();
@@ -121,14 +123,8 @@ export function useChatStream({ onFallback }: UseChatStreamOptions) {
                   ...prev,
                   data: parsed.rows,
                   rowCount: parsed.rowCount,
-                }));
-                break;
-
-              case "token":
-                partialContent += parsed.content;
-                setState((prev) => ({
-                  ...prev,
-                  partialContent,
+                  currentStep: "visualizing",
+                  stepLabel: "시각화 중...",
                 }));
                 break;
 
@@ -137,7 +133,6 @@ export function useChatStream({ onFallback }: UseChatStreamOptions) {
                   ...prev,
                   currentStep: "done",
                   isStreaming: false,
-                  suggestedQuestions: parsed.suggestedQuestions || [],
                 }));
                 break;
 
@@ -156,6 +151,8 @@ export function useChatStream({ onFallback }: UseChatStreamOptions) {
         }
       }
 
+      clearTimeout(streamTimeout);
+
       // 스트림이 끝났는데 done 이벤트가 없었을 경우
       setState((prev) => {
         if (prev.isStreaming) {
@@ -164,6 +161,7 @@ export function useChatStream({ onFallback }: UseChatStreamOptions) {
         return prev;
       });
     } catch (e: any) {
+      clearTimeout(streamTimeout);
       if (e.name === "AbortError") return;
 
       console.warn("스트리밍 실패, 폴백 사용:", e.message);

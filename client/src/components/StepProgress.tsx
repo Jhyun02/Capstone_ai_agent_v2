@@ -8,14 +8,14 @@ interface StepProgressProps {
 const STEPS = [
   { key: "generating_sql" as const, label: "SQL 생성" },
   { key: "executing_sql" as const, label: "쿼리 실행" },
-  { key: "generating_summary" as const, label: "결과 요약" },
+  { key: "visualizing" as const, label: "시각화" },
 ];
 
 // 각 단계의 순서 인덱스
 const STEP_ORDER: Record<string, number> = {
   generating_sql: 0,
   executing_sql: 1,
-  generating_summary: 2,
+  visualizing: 2,
   done: 3,
 };
 

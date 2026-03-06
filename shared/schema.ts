@@ -194,6 +194,40 @@ export interface ColumnInfo {
   sampleValues: string[];
 }
 
+// === 데이터 품질 리포트 타입 ===
+
+export interface QualityReportColumn {
+  name: string;
+  type: "text" | "number" | "date" | "boolean";
+  totalCount: number;
+  nullCount: number;
+  completeness: number;      // 0-100%
+  uniqueCount: number;
+  typeConsistency: number;   // 0-100%
+  // number 전용
+  min?: number;
+  max?: number;
+  mean?: number;
+  outlierCount?: number;
+  // text 전용
+  minLength?: number;
+  maxLength?: number;
+  topValues?: { value: string; count: number }[];
+  // date 전용
+  minDate?: string;
+  maxDate?: string;
+}
+
+export interface QualityReport {
+  datasetId: number;
+  datasetName: string;
+  totalRows: number;
+  sampledRows: number;
+  overallScore: number;        // 0-100
+  columns: QualityReportColumn[];
+  generatedAt: string;
+}
+
 // === KNOWLEDGE BASE (RAG) ===
 
 export const knowledgeDocuments = pgTable("knowledge_documents", {

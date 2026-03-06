@@ -2,7 +2,7 @@ import { useState } from "react";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
-import { Database, Table, Loader2, Info, FileSpreadsheet, Trash2, Eye, ChevronLeft, ChevronRight, FileText } from "lucide-react";
+import { Database, Table, Loader2, Info, FileSpreadsheet, Trash2, Eye, ChevronLeft, ChevronRight, FileText, BarChart3 } from "lucide-react";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import { Badge } from "@/components/ui/badge";
 import { useToast } from "@/hooks/use-toast";
@@ -23,6 +23,7 @@ import {
   AlertDialogHeader,
   AlertDialogTitle,
 } from "@/components/ui/alert-dialog";
+import { QualityReportDialog } from "./QualityReportDialog";
 
 interface ColumnInfo {
   name: string;
@@ -67,6 +68,7 @@ interface DatabasePageProps {
 export function DatabasePage({ refreshKey }: DatabasePageProps) {
   const [viewingDataset, setViewingDataset] = useState<Dataset | null>(null);
   const [deleteDataset, setDeleteDataset] = useState<Dataset | null>(null);
+  const [qualityReportDataset, setQualityReportDataset] = useState<Dataset | null>(null);
   const [currentPage, setCurrentPage] = useState(1);
   const queryClient = useQueryClient();
   const { toast } = useToast();
@@ -260,6 +262,16 @@ export function DatabasePage({ refreshKey }: DatabasePageProps) {
                         >
                           <Eye className="w-4 h-4" />
                         </Button>
+                        {dataset.dataType === 'structured' && (
+                          <Button
+                            variant="ghost"
+                            size="icon"
+                            onClick={() => setQualityReportDataset(dataset)}
+                            data-testid={`button-quality-report-${dataset.id}`}
+                          >
+                            <BarChart3 className="w-4 h-4" />
+                          </Button>
+                        )}
                         <Button
                           variant="ghost"
                           size="icon"
@@ -422,6 +434,11 @@ export function DatabasePage({ refreshKey }: DatabasePageProps) {
           )}
         </DialogContent>
       </Dialog>
+
+      <QualityReportDialog
+        dataset={qualityReportDataset}
+        onClose={() => setQualityReportDataset(null)}
+      />
 
       <AlertDialog open={!!deleteDataset} onOpenChange={(open) => !open && setDeleteDataset(null)}>
         <AlertDialogContent>

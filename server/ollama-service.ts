@@ -181,10 +181,30 @@ export async function generateWithOllamaStream(
       }
     }
 
+    // 버퍼에 남은 데이터 처리 (마지막 청크에 줄바꿈이 없는 경우)
+    if (buffer.trim()) {
+      try {
+        const chunk = JSON.parse(buffer) as { response?: string; done?: boolean };
+        if (chunk.response) {
+          fullResponse += chunk.response;
+          callbacks.onToken(chunk.response);
+        }
+        if (chunk.done) {
+          callbacks.onDone(fullResponse);
+          return;
+        }
+      } catch {
+        // JSON 파싱 실패 시 무시
+      }
+    }
+
     // 스트림이 끝났지만 done 이벤트가 없었을 경우
     callbacks.onDone(fullResponse);
   } catch (e: any) {
-    if (e.name === "AbortError") return; // 클라이언트 연결 끊김
+    if (e.name === "AbortError") {
+      callbacks.onError(new Error("AbortError"));
+      return;
+    }
     console.error("Ollama 스트리밍 오류:", e);
     callbacks.onError(e);
   }

@@ -15,6 +15,8 @@ import {
   knowledgeDocuments,
   documentChunks,
   type ColumnInfo,
+  type QualityReport,
+  type QualityReportColumn,
 } from "@shared/schema";
 import * as documentParser from "./document-parser";
 import * as embeddingService from "./embedding-service";
@@ -258,6 +260,25 @@ Fixed SQL:`;
   }
 }
 
+/**
+ * structured_data 쿼리 결과에서 JSONB 'data' 컬럼을 개별 컬럼으로 펼침.
+ * 예: { id: 1, dataset_id: 3, data: { "이름": "홍길동" } }
+ *   → { "이름": "홍길동" }
+ */
+function flattenJsonbRows(rows: any[]): any[] {
+  if (rows.length === 0) return rows;
+
+  const first = rows[0];
+  if (!first || typeof first.data !== "object" || first.data === null) return rows;
+
+  return rows.map((row) => {
+    if (typeof row.data === "object" && row.data !== null && !Array.isArray(row.data)) {
+      return { ...row.data };
+    }
+    return row;
+  });
+}
+
 function cleanSql(rawSql: string): string {
   let cleaned = rawSql
     .replace(/```sql/gi, "")
@@ -483,7 +504,7 @@ ${dynamicExamples}
       res.json({
         answer: finalAnswer,
         sql: generatedSql,
-        data: queryResult,
+        data: flattenJsonbRows(queryResult),
         suggestedQuestions,
       });
     } catch (err) {
@@ -635,85 +656,11 @@ Rules:
       }
 
       // 데이터 전송
-      sendEvent("data", { rows: queryResult, rowCount: queryResult.length });
+      const flatRows = flattenJsonbRows(queryResult);
+      sendEvent("data", { rows: flatRows, rowCount: flatRows.length });
 
-      // 3단계: 요약 생성 (스트리밍)
-      sendEvent("step", { step: "generating_summary", label: "결과 요약 중..." });
-
-      // [최적화] 요약 프롬프트 압축: 데이터 프리뷰 5행, 지시문 간결화
-      const dataPreview = queryResult.slice(0, 5);
-      const summaryPrompt = `Question: "${message}"
-SQL: ${generatedSql}
-Data (${queryResult.length} rows): ${JSON.stringify(dataPreview)}
-
-한국어로 친절하게 답변. 숫자는 읽기 쉽게 포맷. SQL/기술 용어 금지.
-답변 후 "---추천 질문---"을 적고 후속 질문 3개 작성.`;
-
-      const summarySystem = "친절한 데이터 분석 어시스턴트. 간결한 한국어로 답변.";
-
-      if (process.env.AI_INTEGRATIONS_OPENROUTER_API_KEY) {
-        // OpenRouter는 비스트리밍 (기존 로직 유지)
-        const summaryCompletion = await openai.chat.completions.create({
-          model: MODEL,
-          messages: [
-            { role: "system", content: summarySystem },
-            { role: "user", content: summaryPrompt },
-          ],
-          max_tokens: 512,
-        });
-        const answer = summaryCompletion.choices[0]?.message?.content || "결과를 확인해 주세요.";
-
-        let finalAnswer = answer;
-        let suggestedQuestions: string[] = [];
-        if (answer.includes("---추천 질문---")) {
-          const parts = answer.split("---추천 질문---");
-          finalAnswer = parts[0].trim();
-          suggestedQuestions = parts[1]
-            .split("\n")
-            .map((q) => q.trim().replace(/^-\s*/, "").replace(/^\d+\.\s*/, ""))
-            .filter((q) => q.length > 0);
-        }
-
-        // 전체 답변을 한번에 토큰으로 전송
-        sendEvent("token", { content: finalAnswer });
-        sendEvent("done", { suggestedQuestions });
-      } else {
-        // Ollama 스트리밍
-        await new Promise<void>((resolve, reject) => {
-          let fullResponse = "";
-
-          ollamaService.generateWithOllamaStream(
-            OLLAMA_MODEL,
-            summaryPrompt,
-            summarySystem,
-            {
-              onToken: (token) => {
-                sendEvent("token", { content: token });
-              },
-              onDone: (response) => {
-                fullResponse = response;
-
-                let suggestedQuestions: string[] = [];
-                if (fullResponse.includes("---추천 질문---")) {
-                  const parts = fullResponse.split("---추천 질문---");
-                  suggestedQuestions = parts[1]
-                    .split("\n")
-                    .map((q) => q.trim().replace(/^-\s*/, "").replace(/^\d+\.\s*/, ""))
-                    .filter((q) => q.length > 0);
-                }
-
-                sendEvent("done", { suggestedQuestions });
-                resolve();
-              },
-              onError: (error) => {
-                sendEvent("error", { message: error.message });
-                resolve(); // resolve로 종료 (reject하면 outer catch에서 중복 처리)
-              },
-            },
-            { temperature: 0.2, maxTokens: 400, signal: abortController.signal },
-          );
-        });
-      }
+      // 요약 단계 제거 → 바로 완료
+      sendEvent("done", {});
 
       res.end();
     } catch (err: any) {
@@ -821,6 +768,195 @@ Data (${queryResult.length} rows): ${JSON.stringify(dataPreview)}
     } catch (err) {
       console.error("Get dataset data error:", err);
       res.status(500).json({ message: "Failed to get dataset data" });
+    }
+  });
+
+  // 데이터 품질 리포트
+  app.get("/api/datasets/:id/quality-report", async (req, res) => {
+    try {
+      const id = parseInt(req.params.id);
+      const dataset = await db
+        .select()
+        .from(datasets)
+        .where(eq(datasets.id, id))
+        .limit(1);
+      if (dataset.length === 0) {
+        return res.status(404).json({ message: "Dataset not found" });
+      }
+
+      const ds = dataset[0];
+      if (ds.dataType !== "structured") {
+        return res.status(400).json({ message: "Quality report is only available for structured datasets" });
+      }
+
+      const columnInfo: ColumnInfo[] = ds.columnInfo ? JSON.parse(ds.columnInfo) : [];
+      if (columnInfo.length === 0) {
+        return res.status(400).json({ message: "No column info available" });
+      }
+
+      const useSampling = ds.rowCount > 10000;
+      const sampleCte = useSampling
+        ? `WITH sampled AS (SELECT * FROM structured_data WHERE dataset_id = ${id} ORDER BY RANDOM() LIMIT 10000)`
+        : `WITH sampled AS (SELECT * FROM structured_data WHERE dataset_id = ${id})`;
+      const tableName = "sampled";
+
+      // 메인 집계 쿼리 동적 생성
+      const selectParts: string[] = [`COUNT(*) AS total_count`];
+
+      for (const col of columnInfo) {
+        const colKey = col.name.replace(/'/g, "''");
+        const colAlias = col.name.replace(/[^a-zA-Z0-9_\uAC00-\uD7A3]/g, "_");
+
+        // null/빈값 카운트
+        selectParts.push(
+          `SUM(CASE WHEN data->>'${colKey}' IS NULL OR TRIM(data->>'${colKey}') = '' THEN 1 ELSE 0 END) AS "${colAlias}_null"`
+        );
+        // 고유값 수
+        selectParts.push(
+          `COUNT(DISTINCT data->>'${colKey}') AS "${colAlias}_unique"`
+        );
+
+        if (col.type === "number") {
+          // 타입 일관성 (숫자 정규식)
+          selectParts.push(
+            `SUM(CASE WHEN data->>'${colKey}' IS NOT NULL AND TRIM(data->>'${colKey}') != '' AND data->>'${colKey}' ~ '^-?[0-9,]+\\.?[0-9]*$' THEN 1 ELSE 0 END) AS "${colAlias}_type_match"`
+          );
+          // 숫자 통계
+          selectParts.push(
+            `MIN(CAST(NULLIF(REGEXP_REPLACE(TRIM(data->>'${colKey}'), ',', '', 'g'), '') AS NUMERIC)) AS "${colAlias}_min"`
+          );
+          selectParts.push(
+            `MAX(CAST(NULLIF(REGEXP_REPLACE(TRIM(data->>'${colKey}'), ',', '', 'g'), '') AS NUMERIC)) AS "${colAlias}_max"`
+          );
+          selectParts.push(
+            `AVG(CAST(NULLIF(REGEXP_REPLACE(TRIM(data->>'${colKey}'), ',', '', 'g'), '') AS NUMERIC)) AS "${colAlias}_mean"`
+          );
+          selectParts.push(
+            `STDDEV(CAST(NULLIF(REGEXP_REPLACE(TRIM(data->>'${colKey}'), ',', '', 'g'), '') AS NUMERIC)) AS "${colAlias}_stddev"`
+          );
+        } else if (col.type === "date") {
+          selectParts.push(
+            `SUM(CASE WHEN data->>'${colKey}' IS NOT NULL AND TRIM(data->>'${colKey}') != '' AND data->>'${colKey}' ~ '^\\d{4}[-/]\\d{2}[-/]\\d{2}' THEN 1 ELSE 0 END) AS "${colAlias}_type_match"`
+          );
+          selectParts.push(`MIN(data->>'${colKey}') AS "${colAlias}_min_date"`);
+          selectParts.push(`MAX(data->>'${colKey}') AS "${colAlias}_max_date"`);
+        } else if (col.type === "boolean") {
+          selectParts.push(
+            `SUM(CASE WHEN data->>'${colKey}' IS NOT NULL AND TRIM(data->>'${colKey}') != '' AND LOWER(TRIM(data->>'${colKey}')) IN ('true','false','yes','no','1','0','y','n','예','아니오') THEN 1 ELSE 0 END) AS "${colAlias}_type_match"`
+          );
+        } else {
+          // text: 길이 통계
+          selectParts.push(
+            `MIN(LENGTH(data->>'${colKey}')) AS "${colAlias}_min_len"`
+          );
+          selectParts.push(
+            `MAX(LENGTH(data->>'${colKey}')) AS "${colAlias}_max_len"`
+          );
+        }
+      }
+
+      const mainQuery = `${sampleCte} SELECT ${selectParts.join(", ")} FROM ${tableName}`;
+      const mainResult = await db.execute(sql.raw(mainQuery));
+      const stats = (mainResult as any).rows[0];
+      const totalCount = parseInt(stats.total_count);
+
+      // 텍스트 컬럼 top 5 값 쿼리
+      const textTopValues: Record<string, { value: string; count: number }[]> = {};
+      const textCols = columnInfo.filter((c) => c.type === "text");
+      for (const col of textCols) {
+        const colKey = col.name.replace(/'/g, "''");
+        const topQuery = `${sampleCte} SELECT data->>'${colKey}' AS value, COUNT(*) AS cnt FROM ${tableName} WHERE data->>'${colKey}' IS NOT NULL AND TRIM(data->>'${colKey}') != '' GROUP BY data->>'${colKey}' ORDER BY cnt DESC LIMIT 5`;
+        const topResult = await db.execute(sql.raw(topQuery));
+        textTopValues[col.name] = (topResult as any).rows.map((r: any) => ({
+          value: r.value,
+          count: parseInt(r.cnt),
+        }));
+      }
+
+      // 숫자 컬럼 이상치 카운트
+      const outlierCounts: Record<string, number> = {};
+      const numCols = columnInfo.filter((c) => c.type === "number");
+      for (const col of numCols) {
+        const colAlias = col.name.replace(/[^a-zA-Z0-9_\uAC00-\uD7A3]/g, "_");
+        const mean = parseFloat(stats[`${colAlias}_mean`]);
+        const stddev = parseFloat(stats[`${colAlias}_stddev`]);
+        if (!isNaN(mean) && !isNaN(stddev) && stddev > 0) {
+          const colKey = col.name.replace(/'/g, "''");
+          const outlierQuery = `${sampleCte} SELECT COUNT(*) AS cnt FROM ${tableName} WHERE data->>'${colKey}' IS NOT NULL AND TRIM(data->>'${colKey}') != '' AND data->>'${colKey}' ~ '^-?[0-9,]+\\.?[0-9]*$' AND ABS(CAST(REGEXP_REPLACE(TRIM(data->>'${colKey}'), ',', '', 'g') AS NUMERIC) - ${mean}) > 3 * ${stddev}`;
+          const outlierResult = await db.execute(sql.raw(outlierQuery));
+          outlierCounts[col.name] = parseInt((outlierResult as any).rows[0].cnt);
+        } else {
+          outlierCounts[col.name] = 0;
+        }
+      }
+
+      // 컬럼별 결과 조합
+      const reportColumns: QualityReportColumn[] = columnInfo.map((col) => {
+        const colAlias = col.name.replace(/[^a-zA-Z0-9_\uAC00-\uD7A3]/g, "_");
+        const nullCount = parseInt(stats[`${colAlias}_null`]) || 0;
+        const uniqueCount = parseInt(stats[`${colAlias}_unique`]) || 0;
+        const nonNullCount = totalCount - nullCount;
+        const completeness = totalCount > 0 ? Math.round((nonNullCount / totalCount) * 100) : 0;
+
+        let typeConsistency = 100;
+        if (col.type !== "text" && nonNullCount > 0) {
+          const typeMatch = parseInt(stats[`${colAlias}_type_match`]) || 0;
+          typeConsistency = Math.round((typeMatch / nonNullCount) * 100);
+        }
+
+        const result: QualityReportColumn = {
+          name: col.name,
+          type: col.type,
+          totalCount,
+          nullCount,
+          completeness,
+          uniqueCount,
+          typeConsistency,
+        };
+
+        if (col.type === "number") {
+          const minVal = parseFloat(stats[`${colAlias}_min`]);
+          const maxVal = parseFloat(stats[`${colAlias}_max`]);
+          const meanVal = parseFloat(stats[`${colAlias}_mean`]);
+          if (!isNaN(minVal)) result.min = Math.round(minVal * 100) / 100;
+          if (!isNaN(maxVal)) result.max = Math.round(maxVal * 100) / 100;
+          if (!isNaN(meanVal)) result.mean = Math.round(meanVal * 100) / 100;
+          result.outlierCount = outlierCounts[col.name] || 0;
+        } else if (col.type === "text") {
+          const minLen = parseInt(stats[`${colAlias}_min_len`]);
+          const maxLen = parseInt(stats[`${colAlias}_max_len`]);
+          if (!isNaN(minLen)) result.minLength = minLen;
+          if (!isNaN(maxLen)) result.maxLength = maxLen;
+          result.topValues = textTopValues[col.name] || [];
+        } else if (col.type === "date") {
+          result.minDate = stats[`${colAlias}_min_date`] || undefined;
+          result.maxDate = stats[`${colAlias}_max_date`] || undefined;
+        }
+
+        return result;
+      });
+
+      // 전체 점수: 각 컬럼의 (완전성 + 타입일관성) / 2 의 평균
+      const overallScore = reportColumns.length > 0
+        ? Math.round(
+            reportColumns.reduce((sum, col) => sum + (col.completeness + col.typeConsistency) / 2, 0) / reportColumns.length
+          )
+        : 0;
+
+      const report: QualityReport = {
+        datasetId: id,
+        datasetName: ds.name,
+        totalRows: ds.rowCount,
+        sampledRows: useSampling ? 10000 : ds.rowCount,
+        overallScore,
+        columns: reportColumns,
+        generatedAt: new Date().toISOString(),
+      };
+
+      res.json(report);
+    } catch (err) {
+      console.error("Quality report error:", err);
+      res.status(500).json({ message: "Failed to generate quality report" });
     }
   });
 

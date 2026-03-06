@@ -311,7 +311,7 @@ export default function Home() {
   // Scroll to bottom on new messages or streaming updates
   useEffect(() => {
     bottomRef.current?.scrollIntoView({ behavior: "smooth" });
-  }, [messages, chatMutation.isPending, stream.isStreaming, stream.partialContent, stream.sql, stream.data]);
+  }, [messages, chatMutation.isPending, stream.isStreaming, stream.sql, stream.data]);
 
   function createNewConversation() {
     // Save current messages to the map before switching
@@ -346,22 +346,14 @@ export default function Home() {
   const prevStreamStep = useRef(stream.currentStep);
   useEffect(() => {
     if (prevStreamStep.current !== "done" && stream.currentStep === "done") {
-      // "---추천 질문---" 이전 텍스트만 본문으로 사용
-      let content = stream.partialContent;
-      if (content.includes("---추천 질문---")) {
-        content = content.split("---추천 질문---")[0].trim();
-      }
-
       const responseMessage: Message = {
         id: crypto.randomUUID(),
         role: "assistant",
-        content: content || "결과를 확인해 주세요.",
+        content: "",
         sql: stream.sql,
         data: stream.data,
         timestamp: new Date(),
       };
-      // suggestedQuestions를 메시지에 저장
-      (responseMessage as any).suggestedQuestions = stream.suggestedQuestions;
 
       setMessages((prev) => [...prev, responseMessage]);
       stream.reset();
@@ -647,25 +639,6 @@ export default function Home() {
                         </motion.div>
                       )}
 
-                      {/* 추천 질문 표시 */}
-                      {(msg as any).suggestedQuestions && (msg as any).suggestedQuestions.length > 0 && (
-                        <motion.div
-                          initial={{ opacity: 0 }}
-                          animate={{ opacity: 1 }}
-                          transition={{ delay: 0.3 }}
-                          className="flex flex-wrap gap-2 mt-3"
-                        >
-                          {(msg as any).suggestedQuestions.map((q: string, i: number) => (
-                            <button
-                              key={i}
-                              onClick={() => handleSend(q)}
-                              className="px-3 py-1.5 text-xs bg-primary/10 hover:bg-primary/20 text-primary rounded-full transition-colors border border-primary/20"
-                            >
-                              {q}
-                            </button>
-                          ))}
-                        </motion.div>
-                      )}
                     </div>
                   )}
 
@@ -712,19 +685,11 @@ export default function Home() {
                   <motion.div
                     initial={{ opacity: 0 }}
                     animate={{ opacity: 1 }}
-                    className="w-full"
+                    className="w-full space-y-3"
                   >
+                    {canShowChart(stream.data) && <DataChart data={stream.data} />}
                     <DataTable data={stream.data} />
                   </motion.div>
-                )}
-
-                {stream.partialContent && (
-                  <div className="px-3 sm:px-5 py-2.5 sm:py-3.5 rounded-2xl rounded-tl-none bg-card border border-border/50 shadow-sm text-sm leading-relaxed">
-                    {stream.partialContent.includes("---추천 질문---")
-                      ? stream.partialContent.split("---추천 질문---")[0]
-                      : stream.partialContent}
-                    <span className="inline-block w-2 h-4 bg-primary/60 animate-pulse ml-0.5 align-text-bottom" />
-                  </div>
                 )}
               </div>
             </motion.div>
