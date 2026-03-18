@@ -366,5 +366,4 @@ ollama pull llama3.2:3b  # 최신 버전으로 업데이트
 ## 관련 문서
 
 - [설치 가이드](./SETUP_GUIDE.md)
-- [아키텍처 문서](./ARCHITECTURE.md)
 - [Ollama 공식 문서](https://github.com/ollama/ollama)

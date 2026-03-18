@@ -239,4 +239,3 @@ npm start
 ## 다음 단계
 
 - [Ollama 설치 가이드](./OLLAMA_GUIDE.md) - 로컬 AI 설정
-- [아키텍처 문서](./ARCHITECTURE.md) - 시스템 구조 이해

@@ -1,8 +1,23 @@
-node_modules
-dist
-.DS_Store
-server/public
-vite.config.ts.*
-*.tar.gz
+# 의존성
+node_modules/
+
+# 빌드 출력
+dist/
+server/public/
+
+# 환경 변수
 .env
 .env.*
+!.env.example
+
+# OS
+.DS_Store
+
+# OCR 학습 데이터
+*.traineddata
+
+# Vite
+vite.config.ts.*
+
+# 기타
+*.tar.gz

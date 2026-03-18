@@ -15,6 +15,7 @@ interface Settings {
   modelName: string;
   temperature: number;
   useRag: boolean;
+  chatMode: "sql" | "rag" | "auto";
 }
 
 interface RagModel {

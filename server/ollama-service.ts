@@ -66,6 +66,19 @@ export async function listOllamaModels() {
   }
 }
 
+// 임베딩 모델(nomic-embed-text) 설치 여부 확인
+export async function checkEmbeddingModel(): Promise<boolean> {
+  try {
+    const { models } = await listOllamaModels();
+    return models.some((m: any) => {
+      const name: string = m.name || m.model || '';
+      return name.startsWith('nomic-embed-text');
+    });
+  } catch {
+    return false;
+  }
+}
+
 // 최적화된 Ollama 옵션 (macOS Apple Silicon 최적화)
 const OLLAMA_OPTIMIZED_OPTIONS = {
   num_ctx: 2048,    // 기본 8192에서 축소 → 프롬프트 평가 속도 향상

@@ -1,12 +1,13 @@
-import { Check, Copy } from "lucide-react";
+import { Check, Copy, CheckCircle2, XCircle, ShieldCheck, ShieldAlert } from "lucide-react";
 import { useState } from "react";
-import { motion } from "framer-motion";
+import type { SqlValidation } from "@shared/routes";
 
 interface SqlBlockProps {
   code: string;
+  validation?: SqlValidation;
 }
 
-export function SqlBlock({ code }: SqlBlockProps) {
+export function SqlBlock({ code, validation }: SqlBlockProps) {
   const [copied, setCopied] = useState(false);
 
   const handleCopy = async () => {
@@ -32,6 +33,35 @@ export function SqlBlock({ code }: SqlBlockProps) {
           <code>{code}</code>
         </pre>
       </div>
+
+      {validation && (
+        <div className="px-4 py-3 border-t border-border/50 bg-muted/20">
+          <div className="flex items-center gap-2 mb-2">
+            {validation.overall ? (
+              <ShieldCheck className="w-4 h-4 text-green-500" />
+            ) : (
+              <ShieldAlert className="w-4 h-4 text-yellow-500" />
+            )}
+            <span className="text-xs font-medium text-muted-foreground">
+              SQL 검증 {validation.overall ? "통과" : "경고"}
+            </span>
+          </div>
+          <div className="space-y-1">
+            {validation.items.map((item) => (
+              <div key={item.key} className="flex items-center gap-2 text-xs">
+                {item.passed ? (
+                  <CheckCircle2 className="w-3.5 h-3.5 text-green-500 flex-shrink-0" />
+                ) : (
+                  <XCircle className="w-3.5 h-3.5 text-red-500 flex-shrink-0" />
+                )}
+                <span className={item.passed ? "text-muted-foreground" : "text-red-400"}>
+                  {item.label}: {item.message}
+                </span>
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
     </div>
   );
 }

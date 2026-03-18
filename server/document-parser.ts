@@ -1,6 +1,7 @@
 import officeParser from 'officeparser';
 import mammoth from 'mammoth';
 import Tesseract from 'tesseract.js';
+import JSZip from 'jszip';
 import * as fs from 'fs';
 import * as path from 'path';
 import { exec } from 'child_process';
@@ -8,8 +9,8 @@ import { promisify } from 'util';
 
 const execAsync = promisify(exec);
 
-// pdf-parse is loaded dynamically due to CommonJS compatibility issues
-let pdfParseLib: ((buffer: Buffer) => Promise<any>) | null = null;
+// pdf-parse v2: 클래스 기반 API (PDFParse)
+let PDFParseClass: (new (options: { data: Uint8Array }) => any) | null = null;
 
 export interface ParsedDocument {
   text: string;
@@ -56,32 +57,36 @@ export async function parseDocument(
 
 async function parsePdf(buffer: Buffer): Promise<ParsedDocument> {
   let pageCount = 1;
-  
+
   try {
-    // Dynamic import for pdf-parse (CommonJS compatibility)
-    if (!pdfParseLib) {
-      const module = await import('pdf-parse') as any;
-      pdfParseLib = module.default || module;
+    // pdf-parse v2 클래스 기반 API
+    if (!PDFParseClass) {
+      const module = await import('pdf-parse');
+      PDFParseClass = (module as any).PDFParse || (module as any).default?.PDFParse;
     }
-    const data = await (pdfParseLib as any)(buffer);
-    const text = data.text || '';
-    pageCount = data.numpages || 1;
-    
-    // If we got meaningful text (more than 100 chars), use it
-    if (text.trim().length > 100) {
-      return {
-        text: cleanText(text),
-        pageCount,
-        hasOcr: false,
-        metadata: {
-          info: data.info,
-          version: data.version,
-        },
-      };
+    const parser = new PDFParseClass!({ data: new Uint8Array(buffer) });
+    try {
+      const textResult = await parser.getText();
+      const text = textResult.text || '';
+      pageCount = textResult.total || 1;
+
+      // If we got meaningful text (more than 100 chars), use it
+      if (text.trim().length > 100) {
+        return {
+          text: cleanText(text),
+          pageCount,
+          hasOcr: false,
+          metadata: {
+            pages: textResult.total,
+          },
+        };
+      }
+
+      // Text too short - likely image-based PDF, try OCR
+      console.log('PDF appears to be image-based, attempting OCR...');
+    } finally {
+      await parser.destroy();
     }
-    
-    // Text too short - likely image-based PDF, try OCR
-    console.log('PDF appears to be image-based, attempting OCR...');
   } catch (error) {
     console.log('PDF text extraction failed, attempting OCR...', error);
   }
@@ -193,26 +198,97 @@ async function parseWord(buffer: Buffer): Promise<ParsedDocument> {
   }
 }
 
+// JSZip 기반 PPTX 파서: 슬라이드별 텍스트 + 발표자 노트 추출
+async function parsePptxWithJszip(buffer: Buffer): Promise<ParsedDocument> {
+  const zip = await JSZip.loadAsync(buffer);
+
+  // 슬라이드 파일 목록 수집 및 정렬
+  const slideFiles = Object.keys(zip.files)
+    .filter(f => /^ppt\/slides\/slide\d+\.xml$/i.test(f))
+    .sort((a, b) => {
+      const numA = parseInt(a.match(/slide(\d+)/i)?.[1] || '0');
+      const numB = parseInt(b.match(/slide(\d+)/i)?.[1] || '0');
+      return numA - numB;
+    });
+
+  if (slideFiles.length === 0) {
+    throw new Error('PPTX에서 슬라이드를 찾을 수 없습니다');
+  }
+
+  // 노트 파일 매핑
+  const notesFiles = Object.keys(zip.files)
+    .filter(f => /^ppt\/notesSlides\/notesSlide\d+\.xml$/i.test(f));
+
+  const extractTextFromXml = (xml: string): string => {
+    // <a:t> 태그에서 텍스트만 추출
+    const matches = xml.match(/<a:t[^>]*>([^<]*)<\/a:t>/g) || [];
+    const text = matches
+      .map(m => m.replace(/<\/?a:t[^>]*>/g, ''))
+      .filter(t => t.trim().length > 0)
+      .join(' ')
+      .trim();
+    // 혹시 남은 XML 태그 완전 제거
+    return text.replace(/<[^>]+>/g, '').trim();
+  };
+
+  const textParts: string[] = [];
+
+  for (let i = 0; i < slideFiles.length; i++) {
+    const slideXml = await zip.files[slideFiles[i]].async('text');
+    const slideText = extractTextFromXml(slideXml);
+
+    let noteText = '';
+    const noteFile = `ppt/notesSlides/notesSlide${i + 1}.xml`;
+    if (zip.files[noteFile]) {
+      const noteXml = await zip.files[noteFile].async('text');
+      noteText = extractTextFromXml(noteXml);
+    }
+
+    let slideContent = `[슬라이드 ${i + 1}]\n${slideText}`;
+    if (noteText) {
+      slideContent += `\n[노트] ${noteText}`;
+    }
+    textParts.push(slideContent);
+  }
+
+  const fullText = textParts.join('\n\n');
+  return {
+    text: cleanText(fullText),
+    pageCount: slideFiles.length,
+    hasOcr: false,
+  };
+}
+
+// officeparser 폴백 (구형 .ppt 또는 jszip 실패 시)
+async function parsePptxWithOfficeparser(buffer: Buffer): Promise<ParsedDocument> {
+  const result = await officeParser.parseOffice(buffer);
+  const text = typeof result === 'string' ? result : (result as any).toString?.() || '';
+  const slides = text.split(/\n{3,}/).filter((s: string) => s.trim());
+  return {
+    text: cleanText(text),
+    pageCount: slides.length || 1,
+    hasOcr: false,
+  };
+}
+
 async function parsePowerPoint(buffer: Buffer): Promise<ParsedDocument> {
+  // jszip 기반 파서 시도 → 실패 시 officeparser 폴백
   try {
-    const result = await officeParser.parseOffice(buffer);
-    const text = typeof result === 'string' ? result : (result as any).toString?.() || '';
-    
-    const slides = text.split(/\n{3,}/).filter((s: string) => s.trim());
-    
-    return {
-      text: cleanText(text),
-      pageCount: slides.length || 1,
-      hasOcr: false,
-    };
-  } catch (error) {
-    console.error('PowerPoint parsing error:', error);
-    throw new Error('PowerPoint 파싱에 실패했습니다.');
+    return await parsePptxWithJszip(buffer);
+  } catch (jszipError) {
+    console.log('JSZip PPTX 파싱 실패, officeparser 폴백:', jszipError);
+    try {
+      return await parsePptxWithOfficeparser(buffer);
+    } catch (fallbackError) {
+      console.error('PowerPoint 파싱 완전 실패:', fallbackError);
+      throw new Error('PowerPoint 파싱에 실패했습니다.');
+    }
   }
 }
 
 function cleanText(text: string): string {
   return text
+    .replace(/<[^>]+>/g, ' ')  // XML/HTML 태그 제거
     .replace(/\r\n/g, '\n')
     .replace(/\t/g, ' ')
     .replace(/ +/g, ' ')

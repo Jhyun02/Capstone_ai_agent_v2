@@ -19,7 +19,7 @@ import {
 } from "lucide-react";
 import type { KnowledgeDocument } from "@shared/schema";
 
-const MAX_FILE_SIZE = 10 * 1024 * 1024; // 10MB per file
+const MAX_FILE_SIZE = 100 * 1024 * 1024; // 100MB per file
 const MAX_TOTAL_SIZE = 500 * 1024 * 1024; // 500MB total
 const ALLOWED_EXTENSIONS = ['.pdf', '.doc', '.docx', '.ppt', '.pptx'];
 
@@ -136,7 +136,7 @@ export function KnowledgeBasePage() {
       }
       
       if (file.size > MAX_FILE_SIZE) {
-        errors.push(`${file.name}: 10MB 초과`);
+        errors.push(`${file.name}: 100MB 초과`);
         return;
       }
       
@@ -245,7 +245,7 @@ export function KnowledgeBasePage() {
               클릭하거나 파일을 드래그하여 업로드
             </p>
             <p className="text-xs text-muted-foreground">
-              PDF, DOC, DOCX, PPT, PPTX (파일당 최대 10MB, 총 500MB)
+              PDF, DOC, DOCX, PPT, PPTX (파일당 최대 100MB, 총 500MB)
             </p>
           </div>
           

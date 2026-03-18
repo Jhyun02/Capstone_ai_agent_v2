@@ -48,10 +48,13 @@ interface StoredConversation {
   datasetId?: number | null;
 }
 
+type ChatMode = "sql" | "rag" | "auto";
+
 interface AppSettings {
   modelName: string;
   temperature: number;
   useRag: boolean;
+  chatMode: ChatMode;
 }
 
 export default function Home() {
@@ -84,7 +87,12 @@ export default function Home() {
       const saved = localStorage.getItem("sqlchat_settings");
       if (saved) {
         try {
-          return JSON.parse(saved);
+          const parsed = JSON.parse(saved);
+          // 마이그레이션: 기존 useRag → chatMode
+          if (parsed.chatMode === undefined) {
+            parsed.chatMode = parsed.useRag ? "rag" : "sql";
+          }
+          return parsed;
         } catch {}
       }
     }
@@ -92,6 +100,7 @@ export default function Home() {
       modelName: "mistralai/mistral-7b-instruct:free",
       temperature: 0,
       useRag: false,
+      chatMode: "auto" as ChatMode,
     };
   });
   const [isFileDialogOpen, setIsFileDialogOpen] = useState(false);
@@ -311,7 +320,7 @@ export default function Home() {
   // Scroll to bottom on new messages or streaming updates
   useEffect(() => {
     bottomRef.current?.scrollIntoView({ behavior: "smooth" });
-  }, [messages, chatMutation.isPending, stream.isStreaming, stream.sql, stream.data]);
+  }, [messages, chatMutation.isPending, stream.isStreaming, stream.sql, stream.data, stream.sources]);
 
   function createNewConversation() {
     // Save current messages to the map before switching
@@ -349,9 +358,11 @@ export default function Home() {
       const responseMessage: Message = {
         id: crypto.randomUUID(),
         role: "assistant",
-        content: "",
+        content: stream.answer || "",
         sql: stream.sql,
         data: stream.data,
+        sources: stream.sources,
+        validation: stream.validation,
         timestamp: new Date(),
       };
 
@@ -373,7 +384,7 @@ export default function Home() {
 
     const targetDatasetId = datasetId !== undefined ? datasetId : selectedDatasetId;
 
-    if (settings.useRag) {
+    if (settings.chatMode === "rag") {
       // RAG 모드는 기존 방식 유지
       chatMutation.mutate(
         { message: content, useRag: true, datasetId: targetDatasetId || undefined },
@@ -403,9 +414,12 @@ export default function Home() {
           },
         },
       );
+    } else if (settings.chatMode === "sql") {
+      // SQL 분석 모드: 기존 스트리밍
+      stream.sendStream(content, targetDatasetId || undefined, "sql");
     } else {
-      // SQL 분석 모드: 스트리밍 사용
-      stream.sendStream(content, targetDatasetId || undefined);
+      // 통합 분석 모드 (auto): hybrid 스트리밍
+      stream.sendStream(content, targetDatasetId || undefined, "hybrid");
     }
   };
 
@@ -561,7 +575,7 @@ export default function Home() {
                           animate={{ opacity: 1, height: "auto" }}
                           className="w-full"
                         >
-                          <SqlBlock code={msg.sql} />
+                          <SqlBlock code={msg.sql} validation={msg.validation} />
                         </motion.div>
                       )}
 
@@ -669,7 +683,7 @@ export default function Home() {
                 <Sparkles className="w-5 h-5 animate-pulse" />
               </div>
               <div className="flex flex-col gap-2 max-w-[90%] sm:max-w-[85%]">
-                <StepProgress currentStep={stream.currentStep} />
+                <StepProgress currentStep={stream.currentStep} mode={stream.mode} />
 
                 {stream.sql && (
                   <motion.div
@@ -677,7 +691,7 @@ export default function Home() {
                     animate={{ opacity: 1, height: "auto" }}
                     className="w-full"
                   >
-                    <SqlBlock code={stream.sql} />
+                    <SqlBlock code={stream.sql} validation={stream.validation} />
                   </motion.div>
                 )}
 
@@ -689,6 +703,43 @@ export default function Home() {
                   >
                     {canShowChart(stream.data) && <DataChart data={stream.data} />}
                     <DataTable data={stream.data} />
+                  </motion.div>
+                )}
+
+                {stream.sources && stream.sources.length > 0 && (
+                  <motion.div
+                    initial={{ opacity: 0 }}
+                    animate={{ opacity: 1 }}
+                    className="w-full mt-3"
+                  >
+                    <div className="p-3 rounded-lg bg-muted/50 border border-border/50">
+                      <p className="text-xs font-medium text-muted-foreground mb-2 flex items-center gap-1">
+                        <BookOpen className="w-3 h-3" />
+                        출처
+                      </p>
+                      <div className="space-y-2">
+                        {stream.sources.slice(0, 3).map((source, idx) => (
+                          <div
+                            key={source.chunkId || idx}
+                            className="text-xs p-2 rounded bg-background border border-border/30"
+                          >
+                            <div className="flex items-center gap-2 mb-1">
+                              <span className="font-medium text-foreground">
+                                {source.documentName}
+                              </span>
+                              {source.pageNumber && (
+                                <span className="text-muted-foreground">
+                                  ({source.pageNumber}페이지)
+                                </span>
+                              )}
+                            </div>
+                            <p className="text-muted-foreground line-clamp-2">
+                              {source.content}
+                            </p>
+                          </div>
+                        ))}
+                      </div>
+                    </div>
                   </motion.div>
                 )}
               </div>
@@ -712,7 +763,7 @@ export default function Home() {
                   <span className="w-2 h-2 rounded-full bg-primary animate-bounce" />
                 </div>
                 <span className="text-xs text-muted-foreground animate-pulse ml-1">
-                  {settings.useRag
+                  {settings.chatMode === "rag"
                     ? "문서 검색 중..."
                     : "데이터베이스 분석 중..."}
                 </span>
@@ -789,30 +840,41 @@ export default function Home() {
 
       <div className="w-full bg-background border-t border-border pt-4 pb-4 px-2 sm:px-4 z-40 shrink-0">
         <div className="max-w-4xl mx-auto mb-2 flex flex-wrap items-center justify-between gap-2">
-          <button
-            onClick={() =>
-              setSettings((prev) => ({ ...prev, useRag: !prev.useRag }))
-            }
-            className={`flex items-center gap-2 px-3 py-1.5 rounded-full text-xs font-medium transition-all ${
-              settings.useRag
-                ? "bg-primary/20 text-primary border border-primary/30 hover:bg-primary/30"
-                : "bg-muted text-muted-foreground border border-border hover:bg-muted/80"
-            }`}
-            data-testid="button-mode-toggle"
-          >
-            {settings.useRag ? (
-              <>
-                <BookOpen className="w-3.5 h-3.5" />
-                지식베이스 모드
-              </>
-            ) : (
-              <>
-                <Database className="w-3.5 h-3.5" />
-                SQL 분석 모드
-              </>
-            )}
-            <span className="text-[10px] opacity-60">(클릭하여 전환)</span>
-          </button>
+          <div className="flex items-center rounded-full border border-border bg-muted p-0.5 gap-0.5" data-testid="button-mode-toggle">
+            <button
+              onClick={() => setSettings((prev) => ({ ...prev, chatMode: "sql" as ChatMode, useRag: false }))}
+              className={`flex items-center gap-1.5 px-3 py-1 rounded-full text-xs font-medium transition-all ${
+                settings.chatMode === "sql"
+                  ? "bg-background text-foreground shadow-sm border border-border"
+                  : "text-muted-foreground hover:text-foreground"
+              }`}
+            >
+              <Database className="w-3 h-3" />
+              SQL 분석
+            </button>
+            <button
+              onClick={() => setSettings((prev) => ({ ...prev, chatMode: "rag" as ChatMode, useRag: true }))}
+              className={`flex items-center gap-1.5 px-3 py-1 rounded-full text-xs font-medium transition-all ${
+                settings.chatMode === "rag"
+                  ? "bg-background text-foreground shadow-sm border border-border"
+                  : "text-muted-foreground hover:text-foreground"
+              }`}
+            >
+              <BookOpen className="w-3 h-3" />
+              지식베이스
+            </button>
+            <button
+              onClick={() => setSettings((prev) => ({ ...prev, chatMode: "auto" as ChatMode, useRag: false }))}
+              className={`flex items-center gap-1.5 px-3 py-1 rounded-full text-xs font-medium transition-all ${
+                settings.chatMode === "auto"
+                  ? "bg-primary/20 text-primary shadow-sm border border-primary/30"
+                  : "text-muted-foreground hover:text-foreground"
+              }`}
+            >
+              <Sparkles className="w-3 h-3" />
+              통합 분석
+            </button>
+          </div>
 
           <div className="flex items-center gap-2">
             <Filter className="w-3.5 h-3.5 text-muted-foreground" />

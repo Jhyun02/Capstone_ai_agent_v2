@@ -3,23 +3,29 @@
 ## 1. 시스템 개요
 
 ### 1.1 프로젝트 목적
-한국어 자연어 질문을 SQL 쿼리로 변환하여 PostgreSQL 데이터베이스를 조회하고, 결과를 사용자 친화적인 형태로 제공하는 AI 기반 데이터 분석 챗봇입니다.
+한국어 자연어 질문을 SQL 쿼리로 변환하여 PostgreSQL 데이터베이스를 조회하고, 결과를 사용자 친화적인 형태로 제공하는 AI 기반 데이터 분석 챗봇입니다. 사용자가 업로드한 CSV 데이터셋 및 문서(PDF/DOCX/PPT) 기반 RAG 지식베이스를 지원합니다.
 
 ### 1.2 주요 기능
-- 한국어 자연어 → SQL 쿼리 자동 변환
-- SQL 쿼리 실행 및 결과 테이블 표시
-- 대화 기록 관리 및 저장
-- 다크/라이트 모드 지원
-- 데이터베이스 스키마 조회
+- **SQL 챗봇**: 한국어 자연어 → SQL 쿼리 자동 변환 및 실행
+- **데이터셋 관리**: CSV 업로드, JSONB 기반 구조화 데이터 저장 및 조회
+- **RAG 지식베이스**: PDF/DOCX/PPT 문서 업로드 → 청킹 → 키워드 검색 → AI 답변
+- **데이터 품질 리포트**: 업로드된 데이터셋의 통계/이상치 분석
+- **SSE 스트리밍**: 실시간 AI 응답 스트리밍
+- **다크/라이트 모드**: 테마 전환 지원
+- **듀얼 AI 모드**: OpenRouter (클라우드) / Ollama (로컬) 전환 가능
 
 ### 1.3 기술 스택
 | 영역 | 기술 |
 |------|------|
-| 프론트엔드 | React 18, TypeScript, Tailwind CSS |
-| 백엔드 | Express.js, Node.js |
+| 프론트엔드 | React 18, TypeScript, Tailwind CSS, shadcn/ui |
+| 상태관리 | TanStack React Query, localStorage |
+| 라우팅 | Wouter |
+| 백엔드 | Express.js, Node.js (ESM) |
 | 데이터베이스 | PostgreSQL, Drizzle ORM |
-| AI 모델 | Mistral 7B (OpenRouter API) |
-| 빌드 도구 | Vite, esbuild |
+| AI (클라우드) | OpenRouter API (Mistral Devstral) |
+| AI (로컬) | Ollama (Mistral) |
+| 문서 파싱 | pdf-parse, mammoth, officeparser, Tesseract.js OCR |
+| 빌드 | Vite (클라이언트), esbuild (서버) |
 
 ---
 
@@ -29,363 +35,252 @@
 
 ```
 ┌─────────────────────────────────────────────────────────────────┐
-│                        클라이언트 (React)                        │
-├─────────────┬─────────────┬─────────────┬─────────────┬─────────┤
-│   Sidebar   │   TopNav    │  ChatInput  │   SqlBlock  │DataTable│
-│  (대화목록) │  (탭 네비)  │  (입력창)   │  (SQL표시)  │(결과표) │
-└──────┬──────┴──────┬──────┴──────┬──────┴──────┬──────┴────┬────┘
-       │             │             │             │           │
-       └─────────────┴──────┬──────┴─────────────┴───────────┘
-                            │ HTTP/REST
-                            ▼
+│                      클라이언트 (React SPA)                       │
+├──────────┬──────────┬──────────┬──────────┬─────────────────────┤
+│ Sidebar  │ TopNav   │ ChatInput│ SqlBlock │ KnowledgeBasePage   │
+│(대화목록)│(탭 네비) │(입력창)  │(SQL+차트)│(RAG 문서 관리)      │
+├──────────┴──────────┴──────────┴──────────┴─────────────────────┤
+│                  use-chat-stream.ts (SSE 스트리밍)                │
+└──────────────────────────┬──────────────────────────────────────┘
+                           │ HTTP/SSE
+                           ▼
 ┌─────────────────────────────────────────────────────────────────┐
-│                      백엔드 서버 (Express)                       │
+│                     백엔드 서버 (Express)                         │
 ├─────────────────────────────────────────────────────────────────┤
-│  /api/sql-chat     │  /api/tables                               │
-│  - AI SQL 생성     │  - 테이블 메타데이터                        │
-│  - 쿼리 실행       │                                            │
-│  - 결과 요약       │                                            │
-└──────────┬─────────┴────────────────────────────────────────────┘
-           │
-     ┌─────┴─────┐
-     ▼           ▼
-┌─────────┐ ┌─────────────┐
-│PostgreSQL│ │ OpenRouter  │
-│(Drizzle) │ │ (Mistral AI)│
-└─────────┘ └─────────────┘
+│  routes.ts (모든 API 라우트)                                     │
+│  ├─ /api/chat/sql          SQL 챗봇 (SSE 스트리밍)               │
+│  ├─ /api/datasets/*        데이터셋 CRUD + CSV 업로드            │
+│  ├─ /api/knowledge-base/*  RAG 문서 관리                         │
+│  ├─ /api/rag/query         RAG 질의                              │
+│  └─ /api/ollama/*          Ollama 설정/상태                      │
+├───────────┬───────────┬──────────────┬──────────────────────────┤
+│ rag-      │ document- │ embedding-   │ ollama-                  │
+│ service   │ parser    │ service      │ service                  │
+└─────┬─────┴─────┬─────┴──────┬───────┴──────────┬──────────────┘
+      │           │            │                   │
+      ▼           ▼            ▼                   ▼
+┌──────────┐ ┌─────────┐ ┌──────────┐      ┌────────────┐
+│PostgreSQL│ │Tesseract│ │OpenRouter│      │   Ollama   │
+│(Drizzle) │ │  OCR    │ │  API     │      │ (로컬 AI)  │
+└──────────┘ └─────────┘ └──────────┘      └────────────┘
 ```
 
 ### 2.2 디렉토리 구조
 
 ```
-project/
-├── client/                    # 프론트엔드
-│   └── src/
-│       ├── components/        # UI 컴포넌트
-│       │   ├── Sidebar.tsx    # 사이드바 (대화 목록)
-│       │   ├── TopNav.tsx     # 상단 탭 네비게이션
-│       │   ├── ChatInput.tsx  # 채팅 입력창
-│       │   ├── SqlBlock.tsx   # SQL 코드 블록
-│       │   ├── DataTable.tsx  # 결과 테이블
-│       │   ├── SettingsPage.tsx   # 설정 페이지
-│       │   └── DatabasePage.tsx   # DB 정보 페이지
-│       ├── hooks/
-│       │   └── use-chat.ts    # 채팅 API 훅
-│       ├── pages/
-│       │   └── Home.tsx       # 메인 페이지
-│       └── lib/
-│           └── queryClient.ts # React Query 설정
-├── server/                    # 백엔드
-│   ├── routes.ts              # API 라우트
-│   ├── storage.ts             # 데이터 저장소
-│   └── db.ts                  # DB 연결
-└── shared/                    # 공유 모듈
-    ├── schema.ts              # DB 스키마
-    └── routes.ts              # API 스키마
+Capstone_ai_agent_v2/
+├── client/src/
+│   ├── pages/
+│   │   └── Home.tsx              # 메인 채팅 페이지
+│   ├── components/
+│   │   ├── ChatInput.tsx         # 채팅 입력
+│   │   ├── SqlBlock.tsx          # SQL 결과 표시
+│   │   ├── DataTable.tsx         # 데이터 테이블
+│   │   ├── DataChart.tsx         # 차트 시각화 (recharts)
+│   │   ├── DatabasePage.tsx      # 데이터셋 관리 페이지
+│   │   ├── KnowledgeBasePage.tsx # RAG 지식베이스 페이지
+│   │   ├── SettingsPage.tsx      # 모델/Ollama 설정
+│   │   ├── FileUploadDialog.tsx  # CSV/문서 업로드 다이얼로그
+│   │   ├── QualityReportDialog.tsx # 데이터 품질 리포트
+│   │   ├── StepProgress.tsx      # 처리 단계 진행 표시
+│   │   ├── Sidebar.tsx           # 대화 목록 사이드바
+│   │   ├── TopNav.tsx            # 탭 네비게이션
+│   │   ├── Header.tsx            # 헤더
+│   │   └── ui/                   # shadcn 공통 UI 컴포넌트
+│   ├── hooks/
+│   │   ├── use-chat-stream.ts    # SSE 스트리밍 채팅 훅
+│   │   ├── use-chat.ts           # 채팅 API 뮤테이션 훅
+│   │   ├── use-toast.ts          # 토스트 알림 훅
+│   │   └── use-mobile.tsx        # 모바일 감지 훅
+│   └── lib/
+│       └── queryClient.ts        # React Query 설정
+├── server/
+│   ├── index.ts                  # 서버 엔트리포인트
+│   ├── routes.ts                 # 모든 API 라우트 핸들러
+│   ├── storage.ts                # 데이터 액세스 레이어
+│   ├── db.ts                     # Drizzle DB 연결
+│   ├── rag-service.ts            # RAG 쿼리 실행 + 모델 전환
+│   ├── embedding-service.ts      # 텍스트 임베딩/키워드 검색
+│   ├── document-parser.ts        # PDF/DOCX/PPT 파싱 + OCR
+│   ├── ollama-service.ts         # Ollama 로컬 AI 통합
+│   ├── static.ts                 # 프로덕션 정적 파일 서빙
+│   └── vite.ts                   # 개발 모드 Vite HMR 미들웨어
+├── shared/
+│   ├── schema.ts                 # Drizzle 테이블 정의 + Zod 타입
+│   └── routes.ts                 # API 요청/응답 Zod 스키마
+├── script/
+│   └── build.ts                  # esbuild 프로덕션 빌드 스크립트
+├── docs/
+│   ├── SETUP_GUIDE.md            # 설치 가이드
+│   └── OLLAMA_GUIDE.md           # Ollama 설정 가이드
+└── .env.example                  # 환경 변수 템플릿
 ```
 
 ---
 
-## 3. 컴포넌트 상세 설계
+## 3. 데이터베이스 스키마
 
-### 3.1 프론트엔드 컴포넌트
+### 3.1 ERD
 
-#### 3.1.1 Home (메인 페이지)
-```typescript
-// 주요 상태 관리
-- messages: Message[]           // 현재 대화 메시지
-- conversations: Conversation[] // 전체 대화 목록
-- activeConversationId: string  // 현재 활성 대화
-- activeTab: TabType            // 현재 탭
-- isDarkMode: boolean           // 테마 상태
+```
+┌──────────────────┐     ┌──────────────────┐
+│    datasets      │     │ structured_data  │
+├──────────────────┤     ├──────────────────┤
+│ id (PK)          │◄────│ dataset_id (FK)  │
+│ name             │     │ id (PK)          │
+│ fileName         │     │ data (JSONB)     │
+│ rowCount         │     │ rowIndex         │
+│ columns (JSONB)  │     └──────────────────┘
+│ dataType         │
+│ createdAt        │     ┌──────────────────┐
+└──────────────────┘     │ unstructured_data│
+                         ├──────────────────┤
+┌──────────────────┐     │ dataset_id (FK)  │
+│knowledge_documents│    │ id (PK)          │
+├──────────────────┤     │ content (TEXT)   │
+│ id (PK)          │     └──────────────────┘
+│ title            │
+│ fileType         │     ┌──────────────────┐
+│ fileSize         │     │ document_chunks  │
+│ chunkCount       │     ├──────────────────┤
+│ status           │◄────│ documentId (FK)  │
+│ createdAt        │     │ id (PK)          │
+└──────────────────┘     │ content (TEXT)   │
+                         │ chunkIndex       │
+┌──────────────────┐     │ embedding (JSONB)│
+│    products      │     └──────────────────┘
+├──────────────────┤
+│ id (PK)          │     ┌──────────────────┐
+│ name, category   │     │      sales       │
+│ price, stock     │     ├──────────────────┤
+│ description      │     │ id (PK)          │
+└──────────────────┘     │ product_id (FK)  │
+                         │ quantity         │
+                         │ total_price      │
+                         │ sale_date        │
+                         └──────────────────┘
 ```
 
-**기능:**
-- 대화 생성/선택/삭제/이름변경
-- localStorage 대화 저장 (최대 20개 대화, 80개 메시지)
-- 테마 전환 및 저장
+### 3.2 주요 테이블 설명
 
-#### 3.1.2 Sidebar (사이드바)
-| Props | 타입 | 설명 |
-|-------|------|------|
-| conversations | Conversation[] | 대화 목록 |
-| activeConversationId | string | 현재 대화 ID |
-| onNewConversation | () => void | 새 대화 생성 |
-| onSelectConversation | (id) => void | 대화 선택 |
-| isDarkMode | boolean | 테마 상태 |
-| onToggleTheme | () => void | 테마 전환 |
-
-#### 3.1.3 TopNav (상단 네비게이션)
-**탭 목록:**
-- 채팅 (chat)
-- 데이터베이스 (database)
-- 설정 (settings)
-
-### 3.2 백엔드 API
-
-#### 3.2.1 POST /api/sql-chat
-**요청:**
-```json
-{
-  "message": "가장 비싼 제품 5개 보여줘"
-}
-```
-
-**응답:**
-```json
-{
-  "answer": "가장 비싼 제품 5개는...",
-  "sql": "SELECT * FROM products ORDER BY price DESC LIMIT 5",
-  "data": [
-    {"id": 1, "name": "Laptop Pro", "price": "1299.99", ...}
-  ],
-  "error": null
-}
-```
-
-**처리 흐름:**
-1. 사용자 메시지 수신
-2. AI 모델로 SQL 생성
-3. SQL 실행 (실패 시 폴백 SQL 사용)
-4. AI 모델로 결과 요약 생성
-5. 응답 반환
-
-#### 3.2.2 GET /api/tables
-**응답:**
-```json
-[
-  {
-    "name": "products",
-    "columns": ["id", "name", "category", "price", "stock", "description"],
-    "rowCount": 4
-  },
-  {
-    "name": "sales",
-    "columns": ["id", "product_id", "quantity", "total_price", "sale_date"],
-    "rowCount": 10
-  }
-]
-```
+| 테이블 | 용도 |
+|--------|------|
+| `datasets` | 업로드된 CSV 파일 메타데이터 (이름, 컬럼 정보, 행 수) |
+| `structured_data` | CSV 행 데이터를 JSONB로 저장. `data->>'컬럼명'`으로 쿼리 |
+| `unstructured_data` | 비정형 텍스트 데이터 (키워드 검색용) |
+| `knowledge_documents` | RAG 문서 메타데이터 (제목, 파일 타입, 처리 상태) |
+| `document_chunks` | 문서를 500토큰 단위로 청킹한 텍스트 + 임베딩 |
+| `products` / `sales` | 샘플 비즈니스 데이터 (데모용) |
 
 ---
 
-## 4. 데이터베이스 스키마
+## 4. 핵심 처리 흐름
 
-### 4.1 products 테이블
-| 컬럼 | 타입 | 설명 |
-|------|------|------|
-| id | SERIAL | 기본키 |
-| name | VARCHAR | 제품명 |
-| category | VARCHAR | 카테고리 |
-| price | DECIMAL | 가격 |
-| stock | INTEGER | 재고 |
-| description | TEXT | 설명 |
+### 4.1 SQL 챗봇 흐름 (SSE 스트리밍)
 
-### 4.2 sales 테이블
-| 컬럼 | 타입 | 설명 |
-|------|------|------|
-| id | SERIAL | 기본키 |
-| product_id | INTEGER | 제품 FK |
-| quantity | INTEGER | 수량 |
-| total_price | DECIMAL | 총액 |
-| sale_date | TIMESTAMP | 판매일 |
-
-### 4.3 ERD
 ```
-┌─────────────┐       ┌─────────────┐
-│  products   │       │    sales    │
-├─────────────┤       ├─────────────┤
-│ id (PK)     │◄──────│ product_id  │
-│ name        │       │ id (PK)     │
-│ category    │       │ quantity    │
-│ price       │       │ total_price │
-│ stock       │       │ sale_date   │
-│ description │       └─────────────┘
-└─────────────┘
+사용자 질문 입력
+    │
+    ▼
+[use-chat-stream.ts] ──► POST /api/chat/sql (SSE)
+    │
+    ▼
+routes.ts:
+    ├─ 1. buildDynamicSchema(): 데이터셋 메타데이터로 스키마 문자열 생성
+    ├─ 2. AI (OpenRouter/Ollama): 스키마 + 질문 → SQL 생성
+    ├─ 3. PostgreSQL: SQL 실행 (structured_data 테이블)
+    ├─ 4. 실패 시: fixSqlWithLLM()으로 AI 재시도 1회
+    └─ 5. AI: 결과 요약 (한국어)
+    │
+    ▼
+SSE 이벤트 스트리밍:
+    ├─ step: 진행 단계 표시
+    ├─ sql: 생성된 SQL
+    ├─ data: 쿼리 결과 (행 데이터)
+    ├─ answer: AI 요약 답변
+    └─ done: 완료
+```
+
+### 4.2 RAG 질의 흐름
+
+```
+사용자 질문
+    │
+    ▼
+POST /api/rag/query
+    │
+    ├─ 1. document-parser.ts: 문서 파싱 (PDF/DOCX/PPT + OCR)
+    ├─ 2. embedding-service.ts: 키워드 기반 유사 청크 검색
+    ├─ 3. rag-service.ts: 관련 청크 + 질문 → AI 답변 생성
+    └─ 4. 출처 정보 포함 응답 반환
+```
+
+### 4.3 데이터셋 업로드 흐름
+
+```
+CSV 파일 선택 + 설정
+    │
+    ▼
+POST /api/datasets/upload (multipart/form-data)
+    │
+    ├─ 1. papaparse: CSV 파싱 (인코딩: UTF-8/EUC-KR)
+    ├─ 2. analyzeColumns(): 컬럼 타입 자동 추론
+    ├─ 3. datasets 테이블: 메타데이터 저장
+    └─ 4. structured_data 테이블: JSONB 행 배치 삽입
 ```
 
 ---
 
 ## 5. AI 통합
 
-### 5.1 모델 정보
-- **제공자**: OpenRouter
-- **모델**: mistralai/mistral-7b-instruct:free
-- **용도**: 자연어 → SQL 변환, 결과 요약
+### 5.1 듀얼 모드
+| 모드 | 서비스 | 모델 | 용도 |
+|------|--------|------|------|
+| 클라우드 | OpenRouter API | mistralai/devstral-2512:free | 기본 모드 |
+| 로컬 | Ollama | mistral | API 키 없을 때 폴백 |
 
-### 5.2 프롬프트 설계
+### 5.2 SQL 생성 규칙 (LLM 프롬프트)
+- SELECT 쿼리만 허용
+- 데이터셋 쿼리 시 `WHERE dataset_id = <id>` 필수
+- 숫자/날짜 컬럼은 `CAST()` 사용 (JSONB 텍스트 저장)
+- products/sales와 사용자 데이터셋 간 JOIN 금지
 
-**SQL 생성 프롬프트:**
-```
-You are a SQL expert assistant. Your ONLY job is to convert 
-natural language questions (in Korean or English) into valid 
-PostgreSQL queries.
-
-Database Schema:
-- products (id, name, category, price, stock, description)
-- sales (id, product_id, quantity, total_price, sale_date)
-
-RULES:
-1. Output ONLY the SQL query, nothing else
-2. Use exact table and column names
-3. For price queries, use ORDER BY price DESC/ASC
-4. Always use LIMIT for "top N" queries
-
-Examples:
-- "가장 비싼 제품 5개" → SELECT * FROM products ORDER BY price DESC LIMIT 5
-```
-
-### 5.3 폴백 로직
-AI가 유효한 SQL을 생성하지 못할 경우:
-- 제품 관련 질문 → `SELECT * FROM products ORDER BY price DESC LIMIT 10`
-- 판매 관련 질문 → `SELECT * FROM sales ORDER BY sale_date DESC LIMIT 10`
-- 기타 → `SELECT * FROM products LIMIT 10`
+### 5.3 오류 복구
+1. AI 생성 SQL 실행 실패 → `fixSqlWithLLM()`으로 오류 메시지 전달 후 재시도
+2. 재시도 실패 → 오류 메시지 사용자에게 반환
 
 ---
 
-## 6. 데이터 흐름
+## 6. 상태 관리
 
-### 6.1 채팅 요청 흐름
-```
-사용자 입력
-    │
-    ▼
-[ChatInput] ──► useChat() 훅
-    │
-    ▼
-POST /api/sql-chat
-    │
-    ├──► OpenRouter AI (SQL 생성)
-    │         │
-    │         ▼
-    ├──► PostgreSQL (쿼리 실행)
-    │         │
-    │         ▼
-    └──► OpenRouter AI (결과 요약)
-              │
-              ▼
-         응답 반환
-              │
-              ▼
-[Home] ──► messages 상태 업데이트
-    │
-    ▼
-[SqlBlock] + [DataTable] 렌더링
-```
+| 데이터 | 저장 위치 | 방식 |
+|--------|-----------|------|
+| 서버 데이터 (데이터셋, 문서) | React Query | `staleTime: Infinity` |
+| 대화 기록 | localStorage | 최대 20개 대화, 80개 메시지 |
+| 설정 (모델, 온도, RAG 토글) | localStorage | JSON |
+| 테마 (다크/라이트) | localStorage | boolean |
 
-### 6.2 대화 저장 흐름
-```
-메시지 추가/수정
-    │
-    ▼
-useEffect 트리거
-    │
-    ▼
-localStorage 저장
-(최대 20개 대화, 80개 메시지)
+---
+
+## 7. 환경 변수
+
+```env
+DATABASE_URL=postgresql://...          # PostgreSQL 연결 문자열
+SESSION_SECRET=...                     # 세션 암호키 (32자 이상)
+AI_INTEGRATIONS_OPENROUTER_API_KEY=... # OpenRouter API 키 (선택)
+AI_INTEGRATIONS_OPENROUTER_BASE_URL=... # OpenRouter API URL
+NODE_ENV=development|production
+PORT=5000
 ```
 
 ---
 
-## 7. 성능 최적화
+## 8. 빌드 및 실행
 
-### 7.1 프론트엔드
-- React Query 캐싱
-- Framer Motion 애니메이션 최적화
-- localStorage 크기 제한 (대화/메시지 수 제한)
-
-### 7.2 백엔드
-- AI 토큰 제한 (SQL 생성: 256, 요약: 512)
-- 결과 데이터 미리보기 제한 (10행)
-- 폴백 SQL로 빈 응답 방지
-
-### 7.3 저사양 시스템 지원
-- Mistral 7B 경량 모델 사용 (무료 티어)
-- 최소 토큰 사용으로 응답 시간 단축
-
----
-
-## 8. 보안 고려사항
-
-### 8.1 환경 변수
-| 변수 | 용도 |
-|------|------|
-| DATABASE_URL | PostgreSQL 연결 |
-| AI_INTEGRATIONS_OPENROUTER_API_KEY | AI API 인증 |
-| SESSION_SECRET | 세션 암호화 |
-
-### 8.2 SQL 인젝션 방지
-- AI 생성 SQL만 실행 (사용자 입력 직접 실행 금지)
-- SELECT 쿼리만 허용 (폴백 로직)
-
----
-
-## 9. 향후 개선 계획
-
-### 9.1 기능 확장
-- [ ] 데이터 시각화 차트 추가
-- [x] RAG 기반 프롬프트 강화 (v1.4 완료)
-- [ ] 쿼리 히스토리 및 즐겨찾기
-- [ ] 벡터 DB 도입 (테이블 10개 이상 시)
-
-### 9.2 기술 개선
-- [ ] 서버 사이드 대화 저장 (DB)
-- [ ] 사용자 인증 및 권한 관리
-- [x] SQL 오류 자동 수정 (Retry Logic, v1.4 완료)
-- [x] Few-shot 예시 확장 (v1.4 완료)
-- [ ] 실시간 쿼리 스트리밍
-
----
-
-## 10. RAG 기반 프롬프트 개선 (v1.4)
-
-### 10.1 개선 내용
-
-#### 스키마 메타데이터 강화
+```bash
+npm run dev        # 개발 서버 (Express + Vite HMR, 포트 5000)
+npm run build      # 프로덕션 빌드 (esbuild + Vite)
+npm start          # 프로덕션 실행
+npm run check      # TypeScript 타입 체크
+npm run db:push    # DB 스키마 동기화
 ```
-기존: products (id, name, category, price, stock, description)
-개선: 
-- products 테이블 (제품 정보)
-  - id: SERIAL (PK) - 제품 고유 번호
-  - name: TEXT - 제품명 (예: "노트북", "무선 마우스")
-  - price: NUMERIC - 가격 (원 단위, 정렬 시 CAST 필요)
-  ...
-```
-
-#### Few-shot 예시 확장
-| 질문 유형 | 예시 수 |
-|-----------|---------|
-| 정렬/TOP N 쿼리 | 4개 |
-| 집계 함수 (SUM, AVG, COUNT) | 4개 |
-| JOIN 쿼리 | 3개 |
-| 날짜 필터 | 2개 |
-| 기본 조회 | 3개 |
-
-#### SQL 오류 자동 수정 (Retry Logic)
-```
-1차 시도: AI 생성 SQL 실행
-    ↓ 오류 발생
-2차 시도: LLM에게 오류 메시지와 함께 SQL 수정 요청
-    ↓ 오류 발생
-3차 시도: 폴백 SQL 사용
-```
-
-### 10.2 개선 효과
-| 항목 | 기존 | 개선 후 |
-|------|------|---------|
-| 프롬프트 토큰 | ~200 | ~600 |
-| SQL 정확도 | 70% | 85%+ (예상) |
-| 오류 복구율 | 0% | 60%+ (자동 수정) |
-| 메타데이터 | 컬럼명만 | 타입, 설명, 예시 포함 |
-
----
-
-## 11. 버전 이력
-
-| 버전 | 날짜 | 변경 내용 |
-|------|------|----------|
-| 1.0 | 2026-01-15 | 초기 아키텍처 설계 |
-| 1.1 | 2026-01-15 | UI 오버홀 (사이드바, 탭 네비게이션) |
-| 1.2 | 2026-01-15 | AI 프롬프트 개선 및 폴백 로직 추가 |
-| 1.3 | 2026-01-15 | 반응형 웹 디자인 적용 (모바일/태블릿 지원) |
-| 1.4 | 2026-01-16 | RAG 기반 프롬프트 개선, SQL 오류 자동 수정, 스키마 메타데이터 강화 |

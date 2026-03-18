@@ -3,28 +3,49 @@ import type { StreamStep } from "@/hooks/use-chat-stream";
 
 interface StepProgressProps {
   currentStep: StreamStep;
+  mode?: "sql_only" | "rag_only" | "hybrid";
 }
 
-const STEPS = [
+const SQL_STEPS = [
   { key: "generating_sql" as const, label: "SQL 생성" },
   { key: "executing_sql" as const, label: "쿼리 실행" },
   { key: "visualizing" as const, label: "시각화" },
 ];
 
-// 각 단계의 순서 인덱스
-const STEP_ORDER: Record<string, number> = {
-  generating_sql: 0,
-  executing_sql: 1,
-  visualizing: 2,
-  done: 3,
-};
+const HYBRID_STEPS = [
+  { key: "classifying" as const, label: "모드 판별" },
+  { key: "generating_sql" as const, label: "SQL + 문서 검색" },
+  { key: "synthesizing" as const, label: "통합 분석" },
+  { key: "visualizing" as const, label: "시각화" },
+];
 
-export function StepProgress({ currentStep }: StepProgressProps) {
-  const currentIdx = STEP_ORDER[currentStep] ?? -1;
+const RAG_STEPS = [
+  { key: "searching_docs" as const, label: "문서 검색" },
+  { key: "synthesizing" as const, label: "답변 생성" },
+];
+
+function getSteps(mode?: string) {
+  if (mode === "hybrid") return HYBRID_STEPS;
+  if (mode === "rag_only") return RAG_STEPS;
+  return SQL_STEPS;
+}
+
+function getStepOrder(mode?: string): Record<string, number> {
+  const steps = getSteps(mode);
+  const order: Record<string, number> = {};
+  steps.forEach((s, i) => { order[s.key] = i; });
+  order["done"] = steps.length;
+  return order;
+}
+
+export function StepProgress({ currentStep, mode }: StepProgressProps) {
+  const steps = getSteps(mode);
+  const stepOrder = getStepOrder(mode);
+  const currentIdx = stepOrder[currentStep] ?? -1;
 
   return (
     <div className="flex items-center gap-3 py-2 px-1">
-      {STEPS.map((step, idx) => {
+      {steps.map((step, idx) => {
         const isCompleted = currentIdx > idx;
         const isActive = currentIdx === idx;
 
@@ -48,7 +69,7 @@ export function StepProgress({ currentStep }: StepProgressProps) {
             >
               {step.label}
             </span>
-            {idx < STEPS.length - 1 && (
+            {idx < steps.length - 1 && (
               <div
                 className={`w-6 h-px mx-1 ${
                   currentIdx > idx ? "bg-green-500" : "bg-muted-foreground/20"

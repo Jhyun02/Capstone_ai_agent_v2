@@ -1,5 +1,5 @@
 import { useMutation } from "@tanstack/react-query";
-import { api } from "@shared/routes";
+import { api, type SqlValidation } from "@shared/routes";
 
 export type Message = {
   id: string;
@@ -16,6 +16,7 @@ export type Message = {
     score: number;
   }[];
   error?: string;
+  validation?: SqlValidation;
   timestamp: Date;
 };
 

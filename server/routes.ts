@@ -32,7 +32,7 @@ const MODEL = "mistralai/devstral-2512:free";
 const OLLAMA_MODEL = "mistral";
 
 // buildDynamicSchema 캐시 (datasetId 기준, TTL 1분)
-const schemaCache = new Map<string, { schema: string; examples: string; cachedAt: number }>();
+const schemaCache = new Map<string, { schema: string; examples: string; columnNames: string[]; cachedAt: number }>();
 const SCHEMA_CACHE_TTL = 60_000; // 1분
 
 const upload = multer({
@@ -100,16 +100,17 @@ function analyzeColumns(headers: string[], rows: any[]): ColumnInfo[] {
   });
 }
 
-async function buildDynamicSchema(targetDatasetId?: number): Promise<{ schema: string; examples: string }> {
+async function buildDynamicSchema(targetDatasetId?: number): Promise<{ schema: string; examples: string; columnNames: string[] }> {
   // 캐시 확인
   const cacheKey = String(targetDatasetId ?? "none");
   const cached = schemaCache.get(cacheKey);
   if (cached && Date.now() - cached.cachedAt < SCHEMA_CACHE_TTL) {
-    return { schema: cached.schema, examples: cached.examples };
+    return { schema: cached.schema, examples: cached.examples, columnNames: cached.columnNames };
   }
 
   let schema = ENHANCED_SCHEMA;
   let examples = "";
+  let columnNames: string[] = [];
 
   try {
     const uploadedDatasets = targetDatasetId
@@ -122,6 +123,7 @@ async function buildDynamicSchema(targetDatasetId?: number): Promise<{ schema: s
       for (const dataset of uploadedDatasets) {
         if (dataset.dataType === "structured" && dataset.columnInfo) {
           const columns: ColumnInfo[] = JSON.parse(dataset.columnInfo);
+          columnNames = columns.map(c => c.name);
           const datasetName = dataset.name;
 
           // PostgreSQL storage
@@ -182,8 +184,8 @@ async function buildDynamicSchema(targetDatasetId?: number): Promise<{ schema: s
   }
 
   // 캐시 저장
-  schemaCache.set(cacheKey, { schema, examples, cachedAt: Date.now() });
-  return { schema, examples };
+  schemaCache.set(cacheKey, { schema, examples, columnNames, cachedAt: Date.now() });
+  return { schema, examples, columnNames };
 }
 
 const ENHANCED_SCHEMA = `
@@ -279,6 +281,89 @@ function flattenJsonbRows(rows: any[]): any[] {
   });
 }
 
+import type { SqlValidation, SqlValidationItem } from "@shared/routes";
+
+function validateGeneratedSql(
+  sqlQuery: string,
+  columnNames: string[],
+  datasetId?: number,
+): { items: SqlValidationItem[]; overall: boolean } {
+  const items: SqlValidationItem[] = [];
+  const trimmed = sqlQuery.trim().toLowerCase();
+
+  // 1. 구문 검증: SELECT만 허용, 위험 키워드 차단
+  const dangerousKeywords = /\b(INSERT|UPDATE|DELETE|DROP|TRUNCATE|ALTER|CREATE|GRANT|REVOKE)\b/i;
+  const isSafe = trimmed.startsWith("select") && !dangerousKeywords.test(sqlQuery);
+  items.push({
+    key: "syntax",
+    label: "구문 검증",
+    passed: isSafe,
+    message: isSafe ? "SELECT 쿼리 확인" : "허용되지 않는 SQL 구문 감지",
+  });
+
+  // 2. 스키마 검증: 사용된 컬럼이 실제 데이터셋에 존재하는지
+  if (columnNames.length > 0) {
+    const usedColumns: string[] = [];
+    const colRegex = /data->>'\s*([^']+)'/gi;
+    let match;
+    while ((match = colRegex.exec(sqlQuery)) !== null) {
+      usedColumns.push(match[1].trim());
+    }
+
+    if (usedColumns.length > 0) {
+      const invalidColumns = usedColumns.filter(c => !columnNames.includes(c));
+      const schemaValid = invalidColumns.length === 0;
+      items.push({
+        key: "schema",
+        label: "스키마 검증",
+        passed: schemaValid,
+        message: schemaValid
+          ? `사용된 컬럼 ${usedColumns.length}개 모두 유효`
+          : `존재하지 않는 컬럼: ${invalidColumns.join(", ")}`,
+      });
+    } else {
+      items.push({
+        key: "schema",
+        label: "스키마 검증",
+        passed: true,
+        message: "JSONB 컬럼 접근 없음 (집계 쿼리)",
+      });
+    }
+  }
+
+  // 3. 데이터셋 ID 검증
+  if (datasetId != null) {
+    const idPattern = new RegExp(`dataset_id\\s*=\\s*${datasetId}\\b`);
+    const hasDatasetId = idPattern.test(sqlQuery);
+    items.push({
+      key: "dataset_id",
+      label: "데이터셋 ID 검증",
+      passed: hasDatasetId,
+      message: hasDatasetId
+        ? `dataset_id = ${datasetId} 조건 포함`
+        : `WHERE dataset_id = ${datasetId} 조건 누락`,
+    });
+  }
+
+  const overall = items.every(item => item.passed);
+  return { items, overall };
+}
+
+function addExecutionResult(
+  validation: { items: SqlValidationItem[]; overall: boolean },
+  success: boolean,
+  errorMessage?: string,
+): SqlValidation {
+  const executionItem: SqlValidationItem = {
+    key: "execution",
+    label: "실행 결과",
+    passed: success,
+    message: success ? "쿼리 실행 성공" : `실행 오류: ${errorMessage || "알 수 없는 오류"}`,
+  };
+  const items = [...validation.items, executionItem];
+  return { items, overall: items.every(item => item.passed) };
+}
+
 function cleanSql(rawSql: string): string {
   let cleaned = rawSql
     .replace(/```sql/gi, "")
@@ -315,7 +400,7 @@ export async function registerRoutes(
       const { message, datasetId } = api.chat.sql.input.parse(req.body);
 
       // Build dynamic schema including uploaded datasets
-      const { schema: dynamicSchema, examples: dynamicExamples } = await buildDynamicSchema(datasetId);
+      const { schema: dynamicSchema, examples: dynamicExamples, columnNames } = await buildDynamicSchema(datasetId);
 
       let systemPrompt = `You are a PostgreSQL SQL expert assistant. Convert natural language questions (Korean or English) into valid PostgreSQL queries.
 
@@ -399,6 +484,9 @@ ${dynamicExamples}
         });
       }
 
+      // SQL 검증 수행
+      let preValidation = validateGeneratedSql(generatedSql, columnNames, datasetId);
+
       let queryResult: any[] = [];
       let lastError: string | null = null;
       const MAX_RETRIES = 2;
@@ -428,6 +516,8 @@ ${dynamicExamples}
             if (fixedSql && fixedSql !== generatedSql) {
               console.log("Fixed SQL:", fixedSql);
               generatedSql = fixedSql;
+              // 수정된 SQL 재검증
+              preValidation = validateGeneratedSql(generatedSql, columnNames, datasetId);
             } else {
               generatedSql = getFallbackSql(message);
               console.log("Using fallback SQL:", generatedSql);
@@ -437,12 +527,14 @@ ${dynamicExamples}
       }
 
       if (lastError) {
+        const validation = addExecutionResult(preValidation, false, lastError);
         return res.status(200).json({
           answer:
             "죄송합니다. 해당 질문에 대한 쿼리를 실행할 수 없습니다. 다른 방식으로 질문해 주시겠어요?",
           sql: generatedSql,
           data: [],
           error: lastError,
+          validation,
         });
       }
 
@@ -501,11 +593,13 @@ ${dynamicExamples}
           .filter((q) => q.length > 0);
       }
 
+      const validation = addExecutionResult(preValidation, true);
       res.json({
         answer: finalAnswer,
         sql: generatedSql,
         data: flattenJsonbRows(queryResult),
         suggestedQuestions,
+        validation,
       });
     } catch (err) {
       console.error("Chat error:", err);
@@ -514,6 +608,379 @@ ${dynamicExamples}
       } else {
         res.status(500).json({ message: "Internal server error" });
       }
+    }
+  });
+
+  // === 의도 분류 함수 ===
+  type IntentMode = "sql_only" | "rag_only" | "hybrid";
+
+  function classifyIntent(
+    message: string,
+    hasDataset: boolean,
+    hasKnowledgeBase: boolean,
+  ): { mode: IntentMode; reason: string } {
+    if (hasDataset && !hasKnowledgeBase) {
+      return { mode: "sql_only", reason: "데이터셋만 존재" };
+    }
+    if (!hasDataset && hasKnowledgeBase) {
+      return { mode: "rag_only", reason: "지식베이스만 존재" };
+    }
+    if (!hasDataset && !hasKnowledgeBase) {
+      return { mode: "rag_only", reason: "데이터 소스 없음" };
+    }
+
+    // 둘 다 있을 때 키워드로 세분화
+    const sqlKeywords = /매출|합계|평균|건수|수량|총|최대|최소|개수|통계|증가|감소|비교|추이|순위|상위|하위|집계|분기|월별|연도|기간/;
+    const ragKeywords = /보고서|매뉴얼|규정|정의|문서|가이드|안내|정책|절차|원칙|조항|지침|설명서/;
+
+    const hasSqlKeyword = sqlKeywords.test(message);
+    const hasRagKeyword = ragKeywords.test(message);
+
+    if (hasSqlKeyword && !hasRagKeyword) {
+      return { mode: "sql_only", reason: "데이터 분석 키워드 감지" };
+    }
+    if (hasRagKeyword && !hasSqlKeyword) {
+      return { mode: "rag_only", reason: "문서 참조 키워드 감지" };
+    }
+
+    return { mode: "hybrid", reason: "복합 분석 필요" };
+  }
+
+  // === 통합 분석 (hybrid) SSE 엔드포인트 ===
+  app.post("/api/chat/hybrid", async (req, res) => {
+    res.writeHead(200, {
+      "Content-Type": "text/event-stream",
+      "Cache-Control": "no-cache",
+      Connection: "keep-alive",
+      "X-Accel-Buffering": "no",
+    });
+
+    const sendEvent = (event: string, data: any) => {
+      res.write(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`);
+    };
+
+    const abortController = new AbortController();
+    req.on("close", () => abortController.abort());
+
+    try {
+      const { message, datasetId } = api.chat.hybrid.input.parse(req.body);
+
+      // 1. 데이터 소스 확인
+      sendEvent("step", { step: "classifying", label: "분석 모드 판별 중..." });
+
+      const hasDataset = datasetId != null;
+
+      // 지식베이스 문서 존재 여부 확인
+      const kbCountResult = await db
+        .select({ count: sql<number>`count(*)` })
+        .from(knowledgeDocuments)
+        .where(eq(knowledgeDocuments.status, "ready"));
+      const hasKnowledgeBase = Number(kbCountResult[0]?.count ?? 0) > 0;
+
+      // 2. 의도 분류
+      const intent = classifyIntent(message, hasDataset, hasKnowledgeBase);
+      sendEvent("intent", { mode: intent.mode, reason: intent.reason });
+
+      // 3. 모드별 실행
+      if (intent.mode === "sql_only") {
+        // SQL 전용 파이프라인
+        sendEvent("step", { step: "generating_sql", label: "SQL 생성 중..." });
+        const { schema: dynamicSchema, examples: dynamicExamples, columnNames } = await buildDynamicSchema(datasetId);
+
+        let systemPrompt = `You are a PostgreSQL expert. Convert natural language questions into valid PostgreSQL queries.
+
+${dynamicSchema}
+
+${dynamicExamples}
+
+Rules:
+1. Output ONLY the SQL query (no code blocks, no explanation)
+2. Use ONLY 'structured_data' table (never use sales, products)
+3. No JOINs
+4. Use CAST() for numeric/date column sorting and calculations
+5. Use LIMIT for "top", "best", "most" queries
+6. Access JSONB columns via data->>'column_name'
+7. LIKE search: data->>'col' LIKE '%keyword%'
+8. Use exact column names from schema (no translation)`;
+
+        if (datasetId) {
+          systemPrompt += `\n9. REQUIRED: Always include WHERE dataset_id = ${datasetId}`;
+        }
+
+        let generatedSql = "";
+        if (process.env.AI_INTEGRATIONS_OPENROUTER_API_KEY) {
+          const completion = await openai.chat.completions.create({
+            model: MODEL,
+            messages: [
+              { role: "system", content: systemPrompt },
+              { role: "user", content: message },
+            ],
+            temperature: 0,
+            max_tokens: 256,
+          });
+          generatedSql = cleanSql(completion.choices[0]?.message?.content || "");
+        } else {
+          const result = await ollamaService.generateWithOllama(
+            OLLAMA_MODEL, message, systemPrompt,
+            { temperature: 0, maxTokens: 200 },
+          );
+          generatedSql = cleanSql(result.response || "");
+        }
+
+        if (datasetId && generatedSql) {
+          const idRegex = /dataset_id\s*=\s*(?:'[^']*'|"[^"]*"|\d+|[^\s,;)]+)/gi;
+          if (idRegex.test(generatedSql)) {
+            generatedSql = generatedSql.replace(
+              /dataset_id\s*=\s*(?:'[^']*'|"[^"]*"|\d+|[^\s,;)]+)/gi,
+              `dataset_id = ${datasetId}`,
+            );
+          }
+        }
+
+        if (!generatedSql || !generatedSql.toLowerCase().startsWith("select")) {
+          generatedSql = getFallbackSql(message);
+        }
+
+        if (!generatedSql) {
+          sendEvent("done", { answer: "데이터셋을 선택하거나 업로드해주세요.", sql: "", data: [], sources: [], mode: "sql_only" });
+          res.end();
+          return;
+        }
+
+        sendEvent("sql", { sql: generatedSql });
+        let preValidation = validateGeneratedSql(generatedSql, columnNames, datasetId);
+        sendEvent("validation", preValidation);
+        sendEvent("step", { step: "executing_sql", label: "쿼리 실행 중..." });
+
+        let queryResult: any[] = [];
+        let lastError: string | null = null;
+        const MAX_RETRIES = 2;
+
+        for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
+          try {
+            const result = await db.execute(sql.raw(generatedSql));
+            queryResult = result.rows;
+            lastError = null;
+            break;
+          } catch (dbError: any) {
+            lastError = dbError.message;
+            if (attempt < MAX_RETRIES) {
+              const fixedSql = await fixSqlWithLLM(generatedSql, dbError.message, message, dynamicSchema);
+              if (fixedSql && fixedSql !== generatedSql) {
+                generatedSql = fixedSql;
+                sendEvent("sql", { sql: generatedSql });
+                preValidation = validateGeneratedSql(generatedSql, columnNames, datasetId);
+                sendEvent("validation", preValidation);
+              } else {
+                generatedSql = getFallbackSql(message);
+              }
+            }
+          }
+        }
+
+        if (lastError) {
+          const validation = addExecutionResult(preValidation, false, lastError);
+          sendEvent("done", {
+            answer: "SQL 실행에 실패했습니다. 다른 방식으로 질문해 주세요.",
+            sql: generatedSql, data: [], sources: [], mode: "sql_only", error: lastError,
+            validation,
+          });
+          res.end();
+          return;
+        }
+
+        const flatRows = flattenJsonbRows(queryResult);
+        const validation = addExecutionResult(preValidation, true);
+        sendEvent("data", { rows: flatRows, rowCount: flatRows.length });
+        sendEvent("done", { mode: "sql_only", validation });
+        res.end();
+
+      } else if (intent.mode === "rag_only") {
+        // RAG 전용 파이프라인
+        sendEvent("step", { step: "searching_docs", label: "문서 검색 중..." });
+        const ragResult = await ragService.queryRag(message);
+
+        sendEvent("rag", { sources: ragResult.sources });
+        sendEvent("step", { step: "synthesizing", label: "답변 생성 중..." });
+        sendEvent("done", {
+          answer: ragResult.answer,
+          sql: "", data: [],
+          sources: ragResult.sources,
+          mode: "rag_only",
+        });
+        res.end();
+
+      } else {
+        // hybrid 모드: 병렬 실행
+        sendEvent("step", { step: "generating_sql", label: "SQL 생성 + 문서 검색 병렬 실행 중..." });
+
+        const sqlPipeline = async () => {
+          const { schema: dynamicSchema, examples: dynamicExamples, columnNames } = await buildDynamicSchema(datasetId);
+
+          let systemPrompt = `You are a PostgreSQL expert. Convert natural language questions into valid PostgreSQL queries.
+
+${dynamicSchema}
+
+${dynamicExamples}
+
+Rules:
+1. Output ONLY the SQL query (no code blocks, no explanation)
+2. Use ONLY 'structured_data' table (never use sales, products)
+3. No JOINs
+4. Use CAST() for numeric/date column sorting and calculations
+5. Use LIMIT for "top", "best", "most" queries
+6. Access JSONB columns via data->>'column_name'
+7. LIKE search: data->>'col' LIKE '%keyword%'
+8. Use exact column names from schema (no translation)`;
+
+          if (datasetId) {
+            systemPrompt += `\n9. REQUIRED: Always include WHERE dataset_id = ${datasetId}`;
+          }
+
+          let generatedSql = "";
+          if (process.env.AI_INTEGRATIONS_OPENROUTER_API_KEY) {
+            const completion = await openai.chat.completions.create({
+              model: MODEL,
+              messages: [
+                { role: "system", content: systemPrompt },
+                { role: "user", content: message },
+              ],
+              temperature: 0,
+              max_tokens: 256,
+            });
+            generatedSql = cleanSql(completion.choices[0]?.message?.content || "");
+          } else {
+            const result = await ollamaService.generateWithOllama(
+              OLLAMA_MODEL, message, systemPrompt,
+              { temperature: 0, maxTokens: 200 },
+            );
+            generatedSql = cleanSql(result.response || "");
+          }
+
+          if (datasetId && generatedSql) {
+            const idRegex = /dataset_id\s*=\s*(?:'[^']*'|"[^"]*"|\d+|[^\s,;)]+)/gi;
+            if (idRegex.test(generatedSql)) {
+              generatedSql = generatedSql.replace(
+                /dataset_id\s*=\s*(?:'[^']*'|"[^"]*"|\d+|[^\s,;)]+)/gi,
+                `dataset_id = ${datasetId}`,
+              );
+            }
+          }
+
+          if (!generatedSql || !generatedSql.toLowerCase().startsWith("select")) {
+            generatedSql = getFallbackSql(message);
+          }
+
+          if (!generatedSql) return { sql: "", data: [], error: "데이터셋이 없습니다", validation: undefined };
+
+          // SQL 검증 수행
+          let preValidation = validateGeneratedSql(generatedSql, columnNames, datasetId);
+
+          // SQL 실행
+          let queryResult: any[] = [];
+          let lastError: string | null = null;
+          for (let attempt = 0; attempt <= 2; attempt++) {
+            try {
+              const result = await db.execute(sql.raw(generatedSql));
+              queryResult = result.rows;
+              lastError = null;
+              break;
+            } catch (dbError: any) {
+              lastError = dbError.message;
+              if (attempt < 2) {
+                const fixedSql = await fixSqlWithLLM(generatedSql, dbError.message, message, dynamicSchema);
+                if (fixedSql && fixedSql !== generatedSql) {
+                  generatedSql = fixedSql;
+                  preValidation = validateGeneratedSql(generatedSql, columnNames, datasetId);
+                } else {
+                  generatedSql = getFallbackSql(message);
+                }
+              }
+            }
+          }
+
+          const validation = addExecutionResult(preValidation, !lastError, lastError || undefined);
+          return {
+            sql: generatedSql,
+            data: lastError ? [] : flattenJsonbRows(queryResult),
+            error: lastError,
+            validation,
+          };
+        };
+
+        const ragPipeline = async () => {
+          const context = await ragService.hybridSearch(message, 3);
+          return context.results;
+        };
+
+        const [sqlResult, ragResult] = await Promise.allSettled([sqlPipeline(), ragPipeline()]);
+
+        const sqlData = sqlResult.status === "fulfilled" ? sqlResult.value : { sql: "", data: [], error: "SQL 파이프라인 실패", validation: undefined };
+        const ragSources = ragResult.status === "fulfilled" ? ragResult.value : [];
+
+        // SQL 결과/RAG 출처 전송
+        if (sqlData.sql) sendEvent("sql", { sql: sqlData.sql });
+        if (sqlData.validation) sendEvent("validation", sqlData.validation);
+        if (sqlData.data.length > 0) sendEvent("data", { rows: sqlData.data, rowCount: sqlData.data.length });
+        if (ragSources.length > 0) sendEvent("rag", { sources: ragSources });
+
+        // 통합 요약 생성
+        sendEvent("step", { step: "synthesizing", label: "통합 분석 중..." });
+
+        const sqlSection = sqlData.data.length > 0
+          ? `## 정형 데이터 (SQL 분석 결과)\n쿼리: ${sqlData.sql}\n결과: ${JSON.stringify(sqlData.data.slice(0, 10))}`
+          : sqlData.error ? `## 정형 데이터\nSQL 실행 실패: ${sqlData.error}` : "";
+
+        const ragSection = ragSources.length > 0
+          ? `## 관련 문서 (지식베이스)\n${ragSources.map((s, i) => `[출처 ${i + 1}: ${s.documentName}${s.pageNumber ? ` (${s.pageNumber}페이지)` : ""}]\n${s.content}`).join("\n\n---\n\n")}`
+          : "";
+
+        const synthesisPrompt = `## 질문: ${message}
+
+${sqlSection}
+
+${ragSection}
+
+위 데이터와 문서를 종합하여 한국어로 답변하세요. 수치는 데이터에서, 맥락은 문서에서 인용하세요. 출처를 명시하세요.`;
+
+        let synthesizedAnswer = "";
+        if (process.env.AI_INTEGRATIONS_OPENROUTER_API_KEY) {
+          const completion = await openai.chat.completions.create({
+            model: MODEL,
+            messages: [
+              { role: "system", content: "당신은 정형 데이터(SQL 분석 결과)와 비정형 문서(지식베이스)를 종합 분석하는 AI 어시스턴트입니다. 한국어로 답변합니다." },
+              { role: "user", content: synthesisPrompt },
+            ],
+            temperature: 0.2,
+            max_tokens: 2000,
+          });
+          synthesizedAnswer = completion.choices[0]?.message?.content || "";
+        } else {
+          const result = await ollamaService.generateWithOllama(
+            OLLAMA_MODEL, synthesisPrompt,
+            "당신은 정형 데이터(SQL 분석 결과)와 비정형 문서(지식베이스)를 종합 분석하는 AI 어시스턴트입니다. 한국어로 답변합니다.",
+            { temperature: 0.2, maxTokens: 2000 },
+          );
+          synthesizedAnswer = result.response || "통합 답변 생성에 실패했습니다.";
+        }
+
+        sendEvent("done", {
+          answer: synthesizedAnswer,
+          sql: sqlData.sql,
+          data: sqlData.data,
+          sources: ragSources,
+          mode: "hybrid",
+          validation: sqlData.validation,
+        });
+        res.end();
+      }
+    } catch (err: any) {
+      if (err.name === "AbortError") return;
+      console.error("Hybrid chat error:", err);
+      try {
+        sendEvent("error", { message: err.message || "Internal server error" });
+      } catch {}
+      res.end();
     }
   });
 
@@ -541,7 +1008,7 @@ ${dynamicExamples}
       // 1단계: SQL 생성
       sendEvent("step", { step: "generating_sql", label: "SQL 생성 중..." });
 
-      const { schema: dynamicSchema, examples: dynamicExamples } = await buildDynamicSchema(datasetId);
+      const { schema: dynamicSchema, examples: dynamicExamples, columnNames } = await buildDynamicSchema(datasetId);
 
       // [최적화] 영어 프롬프트로 변환 (Mistral 코드 태스크 성능 향상 + 토큰 수 30-40% 감소)
       let systemPrompt = `You are a PostgreSQL expert. Convert natural language questions into valid PostgreSQL queries.
@@ -615,6 +1082,8 @@ Rules:
 
       // SQL 전송
       sendEvent("sql", { sql: generatedSql });
+      let preValidation = validateGeneratedSql(generatedSql, columnNames, datasetId);
+      sendEvent("validation", preValidation);
 
       // 2단계: SQL 실행
       sendEvent("step", { step: "executing_sql", label: "쿼리 실행 중..." });
@@ -636,6 +1105,8 @@ Rules:
             if (fixedSql && fixedSql !== generatedSql) {
               generatedSql = fixedSql;
               sendEvent("sql", { sql: generatedSql }); // 수정된 SQL 재전송
+              preValidation = validateGeneratedSql(generatedSql, columnNames, datasetId);
+              sendEvent("validation", preValidation);
             } else {
               generatedSql = getFallbackSql(message);
             }
@@ -644,12 +1115,14 @@ Rules:
       }
 
       if (lastError) {
+        const validation = addExecutionResult(preValidation, false, lastError);
         sendEvent("done", {
           answer: "죄송합니다. 해당 질문에 대한 쿼리를 실행할 수 없습니다. 다른 방식으로 질문해 주시겠어요?",
           sql: generatedSql,
           data: [],
           error: lastError,
           suggestedQuestions: [],
+          validation,
         });
         res.end();
         return;
@@ -657,10 +1130,11 @@ Rules:
 
       // 데이터 전송
       const flatRows = flattenJsonbRows(queryResult);
+      const validation = addExecutionResult(preValidation, true);
       sendEvent("data", { rows: flatRows, rowCount: flatRows.length });
 
       // 요약 단계 제거 → 바로 완료
-      sendEvent("done", {});
+      sendEvent("done", { validation });
 
       res.end();
     } catch (err: any) {
@@ -1587,6 +2061,64 @@ Rules:
     res.json({ models: ollamaService.RECOMMENDED_OLLAMA_MODELS });
   });
 
+  // 지식베이스 재인덱싱: embedding이 null인 청크에 임베딩 생성
+  app.post("/api/knowledge-base/reindex", async (req, res) => {
+    try {
+      // embedding이 null인 청크 조회
+      const nullChunks = await db
+        .select({
+          id: documentChunks.id,
+          content: documentChunks.content,
+        })
+        .from(documentChunks)
+        .where(sql`${documentChunks.embedding} IS NULL`)
+        .limit(1000);
+
+      if (nullChunks.length === 0) {
+        return res.json({ total: 0, completed: 0, failed: 0, message: "모든 청크에 임베딩이 존재합니다" });
+      }
+
+      let completed = 0;
+      let failed = 0;
+      const batchSize = 5;
+
+      for (let i = 0; i < nullChunks.length; i += batchSize) {
+        const batch = nullChunks.slice(i, i + batchSize);
+        const results = await Promise.allSettled(
+          batch.map(async (chunk) => {
+            const embResult = await embeddingService.generateEmbedding(chunk.content);
+            if (embResult.embedding.length > 0) {
+              await db
+                .update(documentChunks)
+                .set({ embedding: embResult.embedding })
+                .where(eq(documentChunks.id, chunk.id));
+              return true;
+            }
+            throw new Error("임베딩 생성 실패");
+          }),
+        );
+
+        for (const result of results) {
+          if (result.status === "fulfilled") {
+            completed++;
+          } else {
+            failed++;
+          }
+        }
+      }
+
+      res.json({
+        total: nullChunks.length,
+        completed,
+        failed,
+        message: `${completed}개 청크 임베딩 생성 완료${failed > 0 ? `, ${failed}개 실패` : ""}`,
+      });
+    } catch (err) {
+      console.error("Reindex error:", err);
+      res.status(500).json({ message: "재인덱싱에 실패했습니다" });
+    }
+  });
+
   return httpServer;
 }
 
@@ -1626,15 +2158,27 @@ async function processDocument(
       return;
     }
 
-    // Generate embeddings and insert chunks
+    // 청크 저장 + 임베딩 생성 (Ollama 활성화 시)
     for (let i = 0; i < chunks.length; i++) {
       const chunkContent = chunks[i];
+      let embedding: number[] | null = null;
+
+      try {
+        const embResult = await embeddingService.generateEmbedding(chunkContent);
+        if (embResult.embedding.length > 0) {
+          embedding = embResult.embedding;
+        }
+      } catch (embErr) {
+        // 임베딩 실패 시 null로 저장 (그레이스풀 폴백)
+        console.error(`청크 ${i} 임베딩 생성 실패:`, embErr);
+      }
+
       await db.insert(documentChunks).values({
         documentId: docId,
         chunkIndex: i,
         content: chunkContent,
         pageNumber: Math.floor((i / chunks.length) * parsed.pageCount) + 1,
-        embedding: null, // No embedding
+        embedding: embedding,
       });
     }
 
