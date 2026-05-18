@@ -1,7 +1,7 @@
 import type { Express } from "express";
 import { createServer, type Server } from "http";
 import { storage } from "./storage";
-import { api } from "@shared/routes";
+import { api, sqlValidateInputSchema, sqlValidateOutputSchema, insightInputSchema } from "@shared/routes";
 import { z } from "zod";
 import OpenAI from "openai";
 import { db } from "./db";
@@ -14,21 +14,27 @@ import {
   unstructuredData,
   knowledgeDocuments,
   documentChunks,
+  datasetQualityMetrics,
   type ColumnInfo,
+  type SemanticRole,
   type QualityReport,
   type QualityReportColumn,
+  type ProvenanceInfo,
 } from "@shared/schema";
 import * as documentParser from "./document-parser";
 import * as embeddingService from "./embedding-service";
 import * as ragService from "./rag-service";
 import * as ollamaService from "./ollama-service";
+import * as qualityService from "./quality-service";
+import { executeSqlPipeline } from "./sql-pipeline";
+import { generateTextPrimary, generateTextForValidation, generateTextForSynthesis } from "./services/ai";
 
 const openai = new OpenAI({
   apiKey: process.env.AI_INTEGRATIONS_OPENROUTER_API_KEY || "not-set",
   baseURL: process.env.AI_INTEGRATIONS_OPENROUTER_BASE_URL,
 });
 
-const MODEL = "mistralai/devstral-2512:free";
+const MODEL = "nvidia/nemotron-3-super-120b-a12b:free";
 const OLLAMA_MODEL = "mistral";
 
 // buildDynamicSchema 캐시 (datasetId 기준, TTL 1분)
@@ -167,6 +173,12 @@ async function buildDynamicSchema(targetDatasetId?: number): Promise<{ schema: s
           schema += `2. 필수 조건: WHERE dataset_id = ${dataset.id} (주의: 데이터셋 이름 '${dataset.name}'이 아닌 숫자 ID ${dataset.id}를 사용해야 함)\n`;
           schema += `3. 컬럼 접근: data->>'컬럼명' (예: data->>'${columns[0]?.name || "column"}')\n`;
           schema += `4. 형변환: 숫자/날짜 비교 시 CAST 필수 (예: 숫자/날짜 비교 시 CAST(data->>'컬럼명' AS 타입) 사용. 타입은 NUMERIC, TIMESTAMP, DATE 중 하나여야 함)\n`;
+
+          // DCAT 3.0 DQV 컨텍스트 보호막: 품질 경고 주입
+          const qualityContext = await qualityService.getQualityContext(dataset.id);
+          if (qualityContext) {
+            schema += `\n${qualityContext}\n`;
+          }
         } else if (dataset.dataType === "unstructured") {
           schema += `설명: ${dataset.description || dataset.fileName} (비정형 텍스트 데이터, 키워드 검색 지원)\n`;
           schema += "| 컬럼명 | 타입 | 설명 |\n";
@@ -195,73 +207,6 @@ const ENHANCED_SCHEMA = `
 사용자가 업로드한 데이터셋(structured_data)을 통해서만 질의가 가능합니다.
 `;
 
-async function fixSqlWithLLM(
-  originalSql: string,
-  errorMessage: string,
-  userQuestion: string,
-  schema: string = ENHANCED_SCHEMA,
-): Promise<string> {
-  const fixPrompt = `
-You are a SQL expert. The following SQL query failed with an error. Fix it.
-
-Original Question: "${userQuestion}"
-Failed SQL: ${originalSql}
-Error: ${errorMessage}
-
-Database Schema:
-${schema}
-
-Rules:
-1. Output ONLY the corrected SQL query
-2. No explanations, no markdown
-3. Ensure the query is valid PostgreSQL
-
-Fixed SQL:`;
-
-  try {
-    let fixedSql = "";
-
-    if (process.env.AI_INTEGRATIONS_OPENROUTER_API_KEY) {
-      const completion = await openai.chat.completions.create({
-        model: MODEL,
-        messages: [
-          {
-            role: "system",
-            content:
-              "You are a SQL expert. Output only valid PostgreSQL queries.",
-          },
-          { role: "user", content: fixPrompt },
-        ],
-        temperature: 0,
-        max_tokens: 256,
-      });
-      fixedSql = completion.choices[0]?.message?.content || "";
-    } else {
-      // Ollama fallback
-      const result = await ollamaService.generateWithOllama(
-        OLLAMA_MODEL,
-        fixPrompt,
-        "You are a SQL expert. Output only valid PostgreSQL queries.",
-        { temperature: 0, maxTokens: 200 }, // [최적화] 수정 로직 길이 추가 단축
-      );
-      fixedSql = result.response || "";
-    }
-
-    fixedSql = fixedSql
-      .replace(/```sql/gi, "")
-      .replace(/```/g, "")
-      .trim();
-    const sqlMatch = fixedSql.match(/SELECT[\s\S]*?(?:;|$)/i);
-    if (sqlMatch) {
-      return sqlMatch[0].replace(/;$/, "");
-    }
-    return fixedSql;
-  } catch (err) {
-    console.error("SQL fix error:", err);
-    return originalSql;
-  }
-}
-
 /**
  * structured_data 쿼리 결과에서 JSONB 'data' 컬럼을 개별 컬럼으로 펼침.
  * 예: { id: 1, dataset_id: 3, data: { "이름": "홍길동" } }
@@ -281,110 +226,16 @@ function flattenJsonbRows(rows: any[]): any[] {
   });
 }
 
-import type { SqlValidation, SqlValidationItem } from "@shared/routes";
-
-function validateGeneratedSql(
-  sqlQuery: string,
-  columnNames: string[],
-  datasetId?: number,
-): { items: SqlValidationItem[]; overall: boolean } {
-  const items: SqlValidationItem[] = [];
-  const trimmed = sqlQuery.trim().toLowerCase();
-
-  // 1. 구문 검증: SELECT만 허용, 위험 키워드 차단
-  const dangerousKeywords = /\b(INSERT|UPDATE|DELETE|DROP|TRUNCATE|ALTER|CREATE|GRANT|REVOKE)\b/i;
-  const isSafe = trimmed.startsWith("select") && !dangerousKeywords.test(sqlQuery);
-  items.push({
-    key: "syntax",
-    label: "구문 검증",
-    passed: isSafe,
-    message: isSafe ? "SELECT 쿼리 확인" : "허용되지 않는 SQL 구문 감지",
-  });
-
-  // 2. 스키마 검증: 사용된 컬럼이 실제 데이터셋에 존재하는지
-  if (columnNames.length > 0) {
-    const usedColumns: string[] = [];
-    const colRegex = /data->>'\s*([^']+)'/gi;
-    let match;
-    while ((match = colRegex.exec(sqlQuery)) !== null) {
-      usedColumns.push(match[1].trim());
-    }
-
-    if (usedColumns.length > 0) {
-      const invalidColumns = usedColumns.filter(c => !columnNames.includes(c));
-      const schemaValid = invalidColumns.length === 0;
-      items.push({
-        key: "schema",
-        label: "스키마 검증",
-        passed: schemaValid,
-        message: schemaValid
-          ? `사용된 컬럼 ${usedColumns.length}개 모두 유효`
-          : `존재하지 않는 컬럼: ${invalidColumns.join(", ")}`,
-      });
-    } else {
-      items.push({
-        key: "schema",
-        label: "스키마 검증",
-        passed: true,
-        message: "JSONB 컬럼 접근 없음 (집계 쿼리)",
-      });
-    }
-  }
-
-  // 3. 데이터셋 ID 검증
-  if (datasetId != null) {
-    const idPattern = new RegExp(`dataset_id\\s*=\\s*${datasetId}\\b`);
-    const hasDatasetId = idPattern.test(sqlQuery);
-    items.push({
-      key: "dataset_id",
-      label: "데이터셋 ID 검증",
-      passed: hasDatasetId,
-      message: hasDatasetId
-        ? `dataset_id = ${datasetId} 조건 포함`
-        : `WHERE dataset_id = ${datasetId} 조건 누락`,
-    });
-  }
-
-  const overall = items.every(item => item.passed);
-  return { items, overall };
-}
-
-function addExecutionResult(
-  validation: { items: SqlValidationItem[]; overall: boolean },
-  success: boolean,
-  errorMessage?: string,
-): SqlValidation {
-  const executionItem: SqlValidationItem = {
-    key: "execution",
-    label: "실행 결과",
-    passed: success,
-    message: success ? "쿼리 실행 성공" : `실행 오류: ${errorMessage || "알 수 없는 오류"}`,
-  };
-  const items = [...validation.items, executionItem];
-  return { items, overall: items.every(item => item.passed) };
-}
-
-function cleanSql(rawSql: string): string {
-  let cleaned = rawSql
-    .replace(/```sql/gi, "")
-    .replace(/```/g, "")
-    .trim();
-  const sqlMatch = cleaned.match(/SELECT[\s\S]*?(?:;|$)/i);
-  if (sqlMatch) {
-    cleaned = sqlMatch[0].replace(/;$/, "");
-  }
-  return cleaned;
-}
-
-function getFallbackSql(message: string): string {
-  return "";
-}
-
 export async function registerRoutes(
   httpServer: Server,
   app: Express,
 ): Promise<Server> {
   // await storage.seed(); // Default data seeding disabled
+
+  // 스키마 캐시 무효화 콜백 등록 (품질 서비스에서 사용)
+  qualityService.setSchemaCacheInvalidator((datasetId) => {
+    schemaCache.delete(datasetId);
+  });
 
   app.get("/api/tables", async (req, res) => {
     try {
@@ -398,85 +249,17 @@ export async function registerRoutes(
   app.post(api.chat.sql.path, async (req, res) => {
     try {
       const { message, datasetId } = api.chat.sql.input.parse(req.body);
-
-      // Build dynamic schema including uploaded datasets
       const { schema: dynamicSchema, examples: dynamicExamples, columnNames } = await buildDynamicSchema(datasetId);
 
-      let systemPrompt = `You are a PostgreSQL SQL expert assistant. Convert natural language questions (Korean or English) into valid PostgreSQL queries.
+      const pipelineResult = await executeSqlPipeline({
+        userQuestion: message,
+        datasetId,
+        dynamicSchema,
+        dynamicExamples,
+        columnNames,
+      });
 
-${dynamicSchema}
-
-${dynamicExamples}
-
-=== 규칙 ===
-1. SQL 쿼리만 출력 (코드 블록 X)
-2. 오직 'structured_data' 테이블만 사용하세요. (sales, products 테이블 사용 금지)
-3. JOIN 사용 금지.
-4. 숫자, 날짜관련 컬럼 정렬/계산 시 CAST() 함수 필수 사용
-5. "가장", "top", "best" 요청 시 반드시 LIMIT 사용
-6. "data->>'컬럼명'" 형태로 JSONB 컬럼에 접근
-7. LIKE 검색 시: data->>'컬럼명' LIKE '%keyword%' 형태 유지
-8. 컬럼명은 반드시 스키마에 있는 명칭을 정확히 사용 (임의로 영문 변환 금지)
-`;
-
-      if (datasetId) {
-        // [핵심 변경] 데이터셋 ID가 선택된 경우, AI에게 해당 ID 사용을 강제합니다.
-        systemPrompt += `8. **필수**: 쿼리에 반드시 "WHERE dataset_id = ${datasetId}" 조건을 포함하세요. (데이터셋 이름이 아닌 숫자 ID ${datasetId}를 사용해야 합니다)\n`;
-      } else {
-        systemPrompt += `8. 사용자 업로드 데이터셋(structured_data) 질의 시:
-    - "FROM structured_data WHERE dataset_id = <dataset_id>" 형태 유지
-    - 반드시 **숫자 dataset_id** 사용 (데이터셋 이름 문자열 사용 **절대 금지**). 예: dataset_id = 42 (O), dataset_id = '잘못된이름' (X)\n`;
-      }
-
-      let generatedSql = "";
-
-      console.log(`[AI] Generating SQL using: ${process.env.AI_INTEGRATIONS_OPENROUTER_API_KEY ? "OpenRouter" : "Local Ollama (" + OLLAMA_MODEL + ")"}`);
-
-      if (process.env.AI_INTEGRATIONS_OPENROUTER_API_KEY) {
-        const completion = await openai.chat.completions.create({
-          model: MODEL,
-          messages: [
-            { role: "system", content: systemPrompt },
-            { role: "user", content: message },
-          ],
-          temperature: 0,
-          max_tokens: 256,
-        });
-        generatedSql = cleanSql(completion.choices[0]?.message?.content || "");
-      } else {
-        // Ollama fallback
-        const result = await ollamaService.generateWithOllama(
-          OLLAMA_MODEL,
-          message,
-          systemPrompt,
-          { temperature: 0, maxTokens: 200 }, // [최적화] SQL 생성 길이 추가 단축
-        );
-        generatedSql = cleanSql(result.response || "");
-      }
-
-      console.log("Generated SQL:", generatedSql);
-
-      // [Auto-Correction] datasetId가 명시된 경우, SQL의 dataset_id 조건을 강제로 수정
-      if (datasetId && generatedSql) {
-        // dataset_id = '...' 또는 dataset_id = 123 또는 dataset_id = 이름 형태를 찾아서 올바른 ID로 교체
-        // 정규식 개선: 따옴표로 감싸진 값, 숫자, 또는 공백/구분자 전까지의 문자열을 모두 잡음
-        const idRegex = /dataset_id\s*=\s*(?:'[^']*'|"[^"]*"|\d+|[^\s,;)]+)/gi;
-        if (idRegex.test(generatedSql)) {
-          const fixedSql = generatedSql.replace(idRegex, `dataset_id = ${datasetId}`);
-          if (fixedSql !== generatedSql) {
-            console.log(`[Auto-Fix] Corrected dataset_id: ${generatedSql} -> ${fixedSql}`);
-            generatedSql = fixedSql;
-          }
-        }
-      }
-
-      if (!generatedSql || !generatedSql.toLowerCase().startsWith("select")) {
-        console.log("Invalid SQL, using fallback");
-        generatedSql = getFallbackSql(message);
-        console.log("Fallback SQL:", generatedSql);
-      }
-
-      if (!generatedSql) {
+      if (!pipelineResult.generatedSql) {
         return res.json({
           answer: "데이터셋을 선택하거나 업로드해주세요. 기본 데이터에 대한 질의는 지원하지 않습니다.",
           sql: "",
@@ -484,106 +267,61 @@ ${dynamicExamples}
         });
       }
 
-      // SQL 검증 수행
-      let preValidation = validateGeneratedSql(generatedSql, columnNames, datasetId);
-
-      let queryResult: any[] = [];
-      let lastError: string | null = null;
-      const MAX_RETRIES = 2;
-
-      for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
-        try {
-          const result = await db.execute(sql.raw(generatedSql));
-          queryResult = result.rows;
-          lastError = null;
-          break;
-        } catch (dbError: any) {
-          console.error(
-            `SQL execution error (attempt ${attempt + 1}):`,
-            dbError.message,
-          );
-          lastError = dbError.message;
-
-          if (attempt < MAX_RETRIES) {
-            console.log("Attempting to fix SQL with LLM...");
-            const fixedSql = await fixSqlWithLLM(
-              generatedSql,
-              dbError.message,
-              message,
-              dynamicSchema,
-            );
-
-            if (fixedSql && fixedSql !== generatedSql) {
-              console.log("Fixed SQL:", fixedSql);
-              generatedSql = fixedSql;
-              // 수정된 SQL 재검증
-              preValidation = validateGeneratedSql(generatedSql, columnNames, datasetId);
-            } else {
-              generatedSql = getFallbackSql(message);
-              console.log("Using fallback SQL:", generatedSql);
-            }
-          }
-        }
+      if (pipelineResult.lastError) {
+        return res.status(200).json({
+          answer: "죄송합니다. 해당 질문에 대한 쿼리를 실행할 수 없습니다. 다른 방식으로 질문해 주시겠어요?",
+          sql: pipelineResult.generatedSql,
+          data: [],
+          error: pipelineResult.lastError,
+          validation: pipelineResult.validation,
+          pipelineLog: pipelineResult.pipelineLog,
+        });
       }
 
-      if (lastError) {
-        const validation = addExecutionResult(preValidation, false, lastError);
-        return res.status(200).json({
-          answer:
-            "죄송합니다. 해당 질문에 대한 쿼리를 실행할 수 없습니다. 다른 방식으로 질문해 주시겠어요?",
-          sql: generatedSql,
-          data: [],
-          error: lastError,
-          validation,
-        });
+      const provenance = datasetId
+        ? await qualityService.getProvenanceInfo(datasetId)
+        : null;
+
+      let provenanceInstruction = "";
+      if (provenance && provenance.qualityScore >= 0) {
+        provenanceInstruction = `\n- 답변 마지막에 "---출처---"를 적고 다음 정보를 한 줄로 요약: 데이터셋: ${provenance.datasetName}, 행 수: ${provenance.rowCount.toLocaleString()}, 품질 점수: ${provenance.qualityScore}/100${provenance.warnings.length > 0 ? `, 주의: ${provenance.warnings.slice(0, 2).join("; ")}` : ""}`;
       }
 
       const summaryPrompt = `
 사용자 질문: "${message}"
-실행된 SQL: "${generatedSql}"
-결과 데이터: ${JSON.stringify(queryResult.slice(0, 10))} ${queryResult.length > 10 ? `(총 ${queryResult.length}건 중 10건 표시)` : `(${queryResult.length}건)`}
+실행된 SQL: "${pipelineResult.generatedSql}"
+결과 데이터: ${JSON.stringify(pipelineResult.queryResult.slice(0, 10))} ${pipelineResult.queryResult.length > 10 ? `(총 ${pipelineResult.queryResult.length}건 중 10건 표시)` : `(${pipelineResult.queryResult.length}건)`}
 
 작업:
 - 데이터를 기반으로 사용자 질문에 친절하게 한국어로 답변
 - 숫자가 있으면 읽기 쉽게 포맷 (예: 1000000 → 100만)
 - 데이터가 없으면 "조회된 데이터가 없습니다"라고 안내
-- SQL이나 기술 용어 사용 금지, 결과만 자연스럽게 설명
-- 답변 마지막에 "---추천 질문---"이라고 적고, 이어서 데이터 분석에 도움이 될만한 후속 질문 3가지를 줄바꿈으로 구분하여 작성해줘. (예: "카테고리별 매출 비중은?", "가장 재고가 적은 제품은?")
+- SQL이나 기술 용어 사용 금지, 결과만 자연스럽게 설명${provenanceInstruction}
+- 답변 마지막에 "---추천 질문---"이라고 적고, 이어서 데이터 분석에 도움이 될만한 후속 질문 3가지를 줄바꿈으로 구분하여 작성해줘.
 `;
 
       let answer = "결과를 확인해 주세요.";
-
-      console.log(`[AI] Generating summary using: ${process.env.AI_INTEGRATIONS_OPENROUTER_API_KEY ? "OpenRouter" : "Local Ollama (" + OLLAMA_MODEL + ")"}`);
-
       if (process.env.AI_INTEGRATIONS_OPENROUTER_API_KEY) {
         const summaryCompletion = await openai.chat.completions.create({
           model: MODEL,
           messages: [
-            {
-              role: "system",
-              content:
-                "당신은 친절한 데이터 분석 어시스턴트입니다. 자연스럽고 간결한 한국어로 답변하세요.",
-            },
+            { role: "system", content: "당신은 친절한 데이터 분석 어시스턴트입니다. 자연스럽고 간결한 한국어로 답변하세요." },
             { role: "user", content: summaryPrompt },
           ],
           max_tokens: 512,
         });
         answer = summaryCompletion.choices[0]?.message?.content || answer;
       } else {
-        // Ollama fallback
         const result = await ollamaService.generateWithOllama(
-          OLLAMA_MODEL,
-          summaryPrompt,
+          OLLAMA_MODEL, summaryPrompt,
           "당신은 친절한 데이터 분석 어시스턴트입니다. 자연스럽고 간결한 한국어로 답변하세요.",
-          { temperature: 0.2, maxTokens: 400 }, // [최적화] 요약 답변 길이 추가 단축
+          { temperature: 0.2, maxTokens: 400 },
         );
         answer = result.response || answer;
       }
 
-      // 추천 질문 파싱
       let finalAnswer = answer;
       let suggestedQuestions: string[] = [];
-
       if (answer.includes("---추천 질문---")) {
         const parts = answer.split("---추천 질문---");
         finalAnswer = parts[0].trim();
@@ -593,13 +331,14 @@ ${dynamicExamples}
           .filter((q) => q.length > 0);
       }
 
-      const validation = addExecutionResult(preValidation, true);
       res.json({
         answer: finalAnswer,
-        sql: generatedSql,
-        data: flattenJsonbRows(queryResult),
+        sql: pipelineResult.generatedSql,
+        data: flattenJsonbRows(pipelineResult.queryResult),
         suggestedQuestions,
-        validation,
+        validation: pipelineResult.validation,
+        provenance,
+        pipelineLog: pipelineResult.pipelineLog,
       });
     } catch (err) {
       console.error("Chat error:", err);
@@ -683,116 +422,40 @@ ${dynamicExamples}
 
       // 3. 모드별 실행
       if (intent.mode === "sql_only") {
-        // SQL 전용 파이프라인
-        sendEvent("step", { step: "generating_sql", label: "SQL 생성 중..." });
         const { schema: dynamicSchema, examples: dynamicExamples, columnNames } = await buildDynamicSchema(datasetId);
 
-        let systemPrompt = `You are a PostgreSQL expert. Convert natural language questions into valid PostgreSQL queries.
+        const pipelineResult = await executeSqlPipeline({
+          userQuestion: message,
+          datasetId,
+          dynamicSchema,
+          dynamicExamples,
+          columnNames,
+          onEvent: sendEvent,
+        });
 
-${dynamicSchema}
-
-${dynamicExamples}
-
-Rules:
-1. Output ONLY the SQL query (no code blocks, no explanation)
-2. Use ONLY 'structured_data' table (never use sales, products)
-3. No JOINs
-4. Use CAST() for numeric/date column sorting and calculations
-5. Use LIMIT for "top", "best", "most" queries
-6. Access JSONB columns via data->>'column_name'
-7. LIKE search: data->>'col' LIKE '%keyword%'
-8. Use exact column names from schema (no translation)`;
-
-        if (datasetId) {
-          systemPrompt += `\n9. REQUIRED: Always include WHERE dataset_id = ${datasetId}`;
-        }
-
-        let generatedSql = "";
-        if (process.env.AI_INTEGRATIONS_OPENROUTER_API_KEY) {
-          const completion = await openai.chat.completions.create({
-            model: MODEL,
-            messages: [
-              { role: "system", content: systemPrompt },
-              { role: "user", content: message },
-            ],
-            temperature: 0,
-            max_tokens: 256,
-          });
-          generatedSql = cleanSql(completion.choices[0]?.message?.content || "");
-        } else {
-          const result = await ollamaService.generateWithOllama(
-            OLLAMA_MODEL, message, systemPrompt,
-            { temperature: 0, maxTokens: 200 },
-          );
-          generatedSql = cleanSql(result.response || "");
-        }
-
-        if (datasetId && generatedSql) {
-          const idRegex = /dataset_id\s*=\s*(?:'[^']*'|"[^"]*"|\d+|[^\s,;)]+)/gi;
-          if (idRegex.test(generatedSql)) {
-            generatedSql = generatedSql.replace(
-              /dataset_id\s*=\s*(?:'[^']*'|"[^"]*"|\d+|[^\s,;)]+)/gi,
-              `dataset_id = ${datasetId}`,
-            );
-          }
-        }
-
-        if (!generatedSql || !generatedSql.toLowerCase().startsWith("select")) {
-          generatedSql = getFallbackSql(message);
-        }
-
-        if (!generatedSql) {
+        if (!pipelineResult.generatedSql) {
           sendEvent("done", { answer: "데이터셋을 선택하거나 업로드해주세요.", sql: "", data: [], sources: [], mode: "sql_only" });
           res.end();
           return;
         }
 
-        sendEvent("sql", { sql: generatedSql });
-        let preValidation = validateGeneratedSql(generatedSql, columnNames, datasetId);
-        sendEvent("validation", preValidation);
-        sendEvent("step", { step: "executing_sql", label: "쿼리 실행 중..." });
-
-        let queryResult: any[] = [];
-        let lastError: string | null = null;
-        const MAX_RETRIES = 2;
-
-        for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
-          try {
-            const result = await db.execute(sql.raw(generatedSql));
-            queryResult = result.rows;
-            lastError = null;
-            break;
-          } catch (dbError: any) {
-            lastError = dbError.message;
-            if (attempt < MAX_RETRIES) {
-              const fixedSql = await fixSqlWithLLM(generatedSql, dbError.message, message, dynamicSchema);
-              if (fixedSql && fixedSql !== generatedSql) {
-                generatedSql = fixedSql;
-                sendEvent("sql", { sql: generatedSql });
-                preValidation = validateGeneratedSql(generatedSql, columnNames, datasetId);
-                sendEvent("validation", preValidation);
-              } else {
-                generatedSql = getFallbackSql(message);
-              }
-            }
-          }
-        }
-
-        if (lastError) {
-          const validation = addExecutionResult(preValidation, false, lastError);
+        if (pipelineResult.lastError) {
           sendEvent("done", {
             answer: "SQL 실행에 실패했습니다. 다른 방식으로 질문해 주세요.",
-            sql: generatedSql, data: [], sources: [], mode: "sql_only", error: lastError,
-            validation,
+            sql: pipelineResult.generatedSql, data: [], sources: [], mode: "sql_only",
+            error: pipelineResult.lastError, validation: pipelineResult.validation,
           });
           res.end();
           return;
         }
 
-        const flatRows = flattenJsonbRows(queryResult);
-        const validation = addExecutionResult(preValidation, true);
+        const flatRows = flattenJsonbRows(pipelineResult.queryResult);
         sendEvent("data", { rows: flatRows, rowCount: flatRows.length });
-        sendEvent("done", { mode: "sql_only", validation });
+
+        const provenance = datasetId
+          ? await qualityService.getProvenanceInfo(datasetId)
+          : null;
+        sendEvent("done", { mode: "sql_only", validation: pipelineResult.validation, provenance });
         res.end();
 
       } else if (intent.mode === "rag_only") {
@@ -817,94 +480,19 @@ Rules:
         const sqlPipeline = async () => {
           const { schema: dynamicSchema, examples: dynamicExamples, columnNames } = await buildDynamicSchema(datasetId);
 
-          let systemPrompt = `You are a PostgreSQL expert. Convert natural language questions into valid PostgreSQL queries.
+          const result = await executeSqlPipeline({
+            userQuestion: message,
+            datasetId,
+            dynamicSchema,
+            dynamicExamples,
+            columnNames,
+          });
 
-${dynamicSchema}
-
-${dynamicExamples}
-
-Rules:
-1. Output ONLY the SQL query (no code blocks, no explanation)
-2. Use ONLY 'structured_data' table (never use sales, products)
-3. No JOINs
-4. Use CAST() for numeric/date column sorting and calculations
-5. Use LIMIT for "top", "best", "most" queries
-6. Access JSONB columns via data->>'column_name'
-7. LIKE search: data->>'col' LIKE '%keyword%'
-8. Use exact column names from schema (no translation)`;
-
-          if (datasetId) {
-            systemPrompt += `\n9. REQUIRED: Always include WHERE dataset_id = ${datasetId}`;
-          }
-
-          let generatedSql = "";
-          if (process.env.AI_INTEGRATIONS_OPENROUTER_API_KEY) {
-            const completion = await openai.chat.completions.create({
-              model: MODEL,
-              messages: [
-                { role: "system", content: systemPrompt },
-                { role: "user", content: message },
-              ],
-              temperature: 0,
-              max_tokens: 256,
-            });
-            generatedSql = cleanSql(completion.choices[0]?.message?.content || "");
-          } else {
-            const result = await ollamaService.generateWithOllama(
-              OLLAMA_MODEL, message, systemPrompt,
-              { temperature: 0, maxTokens: 200 },
-            );
-            generatedSql = cleanSql(result.response || "");
-          }
-
-          if (datasetId && generatedSql) {
-            const idRegex = /dataset_id\s*=\s*(?:'[^']*'|"[^"]*"|\d+|[^\s,;)]+)/gi;
-            if (idRegex.test(generatedSql)) {
-              generatedSql = generatedSql.replace(
-                /dataset_id\s*=\s*(?:'[^']*'|"[^"]*"|\d+|[^\s,;)]+)/gi,
-                `dataset_id = ${datasetId}`,
-              );
-            }
-          }
-
-          if (!generatedSql || !generatedSql.toLowerCase().startsWith("select")) {
-            generatedSql = getFallbackSql(message);
-          }
-
-          if (!generatedSql) return { sql: "", data: [], error: "데이터셋이 없습니다", validation: undefined };
-
-          // SQL 검증 수행
-          let preValidation = validateGeneratedSql(generatedSql, columnNames, datasetId);
-
-          // SQL 실행
-          let queryResult: any[] = [];
-          let lastError: string | null = null;
-          for (let attempt = 0; attempt <= 2; attempt++) {
-            try {
-              const result = await db.execute(sql.raw(generatedSql));
-              queryResult = result.rows;
-              lastError = null;
-              break;
-            } catch (dbError: any) {
-              lastError = dbError.message;
-              if (attempt < 2) {
-                const fixedSql = await fixSqlWithLLM(generatedSql, dbError.message, message, dynamicSchema);
-                if (fixedSql && fixedSql !== generatedSql) {
-                  generatedSql = fixedSql;
-                  preValidation = validateGeneratedSql(generatedSql, columnNames, datasetId);
-                } else {
-                  generatedSql = getFallbackSql(message);
-                }
-              }
-            }
-          }
-
-          const validation = addExecutionResult(preValidation, !lastError, lastError || undefined);
           return {
-            sql: generatedSql,
-            data: lastError ? [] : flattenJsonbRows(queryResult),
-            error: lastError,
-            validation,
+            sql: result.generatedSql,
+            data: result.lastError ? [] : flattenJsonbRows(result.queryResult),
+            error: result.lastError,
+            validation: result.validation,
           };
         };
 
@@ -986,156 +574,68 @@ ${ragSection}
 
   // === SSE 스트리밍 엔드포인트 ===
   app.post("/api/sql-chat-stream", async (req, res) => {
-    // SSE 헤더 설정
     res.writeHead(200, {
       "Content-Type": "text/event-stream",
       "Cache-Control": "no-cache",
       Connection: "keep-alive",
-      "X-Accel-Buffering": "no", // nginx 버퍼링 비활성화
+      "X-Accel-Buffering": "no",
     });
 
     const sendEvent = (event: string, data: any) => {
       res.write(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`);
     };
 
-    // 클라이언트 연결 끊김 감지
     const abortController = new AbortController();
     req.on("close", () => abortController.abort());
 
     try {
       const { message, datasetId } = api.chat.sql.input.parse(req.body);
-
-      // 1단계: SQL 생성
-      sendEvent("step", { step: "generating_sql", label: "SQL 생성 중..." });
-
       const { schema: dynamicSchema, examples: dynamicExamples, columnNames } = await buildDynamicSchema(datasetId);
 
-      // [최적화] 영어 프롬프트로 변환 (Mistral 코드 태스크 성능 향상 + 토큰 수 30-40% 감소)
-      let systemPrompt = `You are a PostgreSQL expert. Convert natural language questions into valid PostgreSQL queries.
+      const pipelineResult = await executeSqlPipeline({
+        userQuestion: message,
+        datasetId,
+        dynamicSchema,
+        dynamicExamples,
+        columnNames,
+        onEvent: sendEvent,
+      });
 
-${dynamicSchema}
-
-${dynamicExamples}
-
-Rules:
-1. Output ONLY the SQL query (no code blocks, no explanation)
-2. Use ONLY 'structured_data' table (never use sales, products)
-3. No JOINs
-4. Use CAST() for numeric/date column sorting and calculations
-5. Use LIMIT for "top", "best", "most" queries
-6. Access JSONB columns via data->>'column_name'
-7. LIKE search: data->>'col' LIKE '%keyword%'
-8. Use exact column names from schema (no translation)`;
-
-      if (datasetId) {
-        systemPrompt += `\n9. REQUIRED: Always include WHERE dataset_id = ${datasetId}`;
-      }
-
-      let generatedSql = "";
-
-      if (process.env.AI_INTEGRATIONS_OPENROUTER_API_KEY) {
-        const completion = await openai.chat.completions.create({
-          model: MODEL,
-          messages: [
-            { role: "system", content: systemPrompt },
-            { role: "user", content: message },
-          ],
-          temperature: 0,
-          max_tokens: 256,
-        });
-        generatedSql = cleanSql(completion.choices[0]?.message?.content || "");
-      } else {
-        const result = await ollamaService.generateWithOllama(
-          OLLAMA_MODEL,
-          message,
-          systemPrompt,
-          { temperature: 0, maxTokens: 200 },
-        );
-        generatedSql = cleanSql(result.response || "");
-      }
-
-      // dataset_id 자동 수정
-      if (datasetId && generatedSql) {
-        const idRegex = /dataset_id\s*=\s*(?:'[^']*'|"[^"]*"|\d+|[^\s,;)]+)/gi;
-        if (idRegex.test(generatedSql)) {
-          generatedSql = generatedSql.replace(
-            /dataset_id\s*=\s*(?:'[^']*'|"[^"]*"|\d+|[^\s,;)]+)/gi,
-            `dataset_id = ${datasetId}`,
-          );
-        }
-      }
-
-      if (!generatedSql || !generatedSql.toLowerCase().startsWith("select")) {
-        generatedSql = getFallbackSql(message);
-      }
-
-      if (!generatedSql) {
+      if (!pipelineResult.generatedSql) {
         sendEvent("done", {
           answer: "데이터셋을 선택하거나 업로드해주세요.",
-          sql: "",
-          data: [],
-          suggestedQuestions: [],
+          sql: "", data: [], suggestedQuestions: [],
         });
         res.end();
         return;
       }
 
-      // SQL 전송
-      sendEvent("sql", { sql: generatedSql });
-      let preValidation = validateGeneratedSql(generatedSql, columnNames, datasetId);
-      sendEvent("validation", preValidation);
-
-      // 2단계: SQL 실행
-      sendEvent("step", { step: "executing_sql", label: "쿼리 실행 중..." });
-
-      let queryResult: any[] = [];
-      let lastError: string | null = null;
-      const MAX_RETRIES = 2;
-
-      for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
-        try {
-          const result = await db.execute(sql.raw(generatedSql));
-          queryResult = result.rows;
-          lastError = null;
-          break;
-        } catch (dbError: any) {
-          lastError = dbError.message;
-          if (attempt < MAX_RETRIES) {
-            const fixedSql = await fixSqlWithLLM(generatedSql, dbError.message, message, dynamicSchema);
-            if (fixedSql && fixedSql !== generatedSql) {
-              generatedSql = fixedSql;
-              sendEvent("sql", { sql: generatedSql }); // 수정된 SQL 재전송
-              preValidation = validateGeneratedSql(generatedSql, columnNames, datasetId);
-              sendEvent("validation", preValidation);
-            } else {
-              generatedSql = getFallbackSql(message);
-            }
-          }
-        }
-      }
-
-      if (lastError) {
-        const validation = addExecutionResult(preValidation, false, lastError);
+      if (pipelineResult.lastError) {
         sendEvent("done", {
           answer: "죄송합니다. 해당 질문에 대한 쿼리를 실행할 수 없습니다. 다른 방식으로 질문해 주시겠어요?",
-          sql: generatedSql,
+          sql: pipelineResult.generatedSql,
           data: [],
-          error: lastError,
+          error: pipelineResult.lastError,
           suggestedQuestions: [],
-          validation,
+          validation: pipelineResult.validation,
+          pipelineLog: pipelineResult.pipelineLog,
         });
         res.end();
         return;
       }
 
-      // 데이터 전송
-      const flatRows = flattenJsonbRows(queryResult);
-      const validation = addExecutionResult(preValidation, true);
+      const flatRows = flattenJsonbRows(pipelineResult.queryResult);
       sendEvent("data", { rows: flatRows, rowCount: flatRows.length });
 
-      // 요약 단계 제거 → 바로 완료
-      sendEvent("done", { validation });
+      const provenance = datasetId
+        ? await qualityService.getProvenanceInfo(datasetId)
+        : null;
 
+      sendEvent("done", {
+        validation: pipelineResult.validation,
+        provenance,
+        pipelineLog: pipelineResult.pipelineLog,
+      });
       res.end();
     } catch (err: any) {
       if (err.name === "AbortError") return;
@@ -1245,6 +745,46 @@ Rules:
     }
   });
 
+  // DCAT 3.0 DQV 품질 메트릭 요약 (데이터셋 카드용)
+  app.get("/api/datasets/:id/quality-metrics", async (req, res) => {
+    try {
+      const id = parseInt(req.params.id);
+      const result = await db
+        .select()
+        .from(datasetQualityMetrics)
+        .where(eq(datasetQualityMetrics.datasetId, id))
+        .limit(1);
+
+      if (result.length === 0) {
+        return res.json(null);
+      }
+
+      const qm = result[0];
+      const warnings: string[] = [];
+      if (qm.columnMetrics) {
+        const metrics = qm.columnMetrics as any[];
+        for (const col of metrics) {
+          for (const w of col.warnings) {
+            warnings.push(`${col.name}: ${w}`);
+          }
+        }
+      }
+
+      res.json({
+        overallScore: parseInt(String(qm.overallScore)),
+        completeness: parseInt(String(qm.completeness)),
+        consistency: parseInt(String(qm.consistency)),
+        validity: parseInt(String(qm.validity)),
+        timeliness: qm.timeliness ? parseInt(String(qm.timeliness)) : null,
+        warnings,
+        measuredAt: qm.measuredAt?.toISOString() || null,
+      });
+    } catch (err) {
+      console.error("Quality metrics error:", err);
+      res.status(500).json({ message: "Failed to get quality metrics" });
+    }
+  });
+
   // 데이터 품질 리포트
   app.get("/api/datasets/:id/quality-report", async (req, res) => {
     try {
@@ -1261,6 +801,18 @@ Rules:
       const ds = dataset[0];
       if (ds.dataType !== "structured") {
         return res.status(400).json({ message: "Quality report is only available for structured datasets" });
+      }
+
+      // 캐시된 리포트가 있으면 즉시 반환
+      const cached = await db
+        .select({ reportCache: datasetQualityMetrics.reportCache, dcatMetadata: datasetQualityMetrics.dcatMetadata })
+        .from(datasetQualityMetrics)
+        .where(eq(datasetQualityMetrics.datasetId, id))
+        .limit(1);
+
+      if (cached.length > 0 && cached[0].reportCache) {
+        const report = cached[0].reportCache as QualityReport;
+        return res.json({ ...report, dcatMetadata: cached[0].dcatMetadata });
       }
 
       const columnInfo: ColumnInfo[] = ds.columnInfo ? JSON.parse(ds.columnInfo) : [];
@@ -1295,18 +847,20 @@ Rules:
           selectParts.push(
             `SUM(CASE WHEN data->>'${colKey}' IS NOT NULL AND TRIM(data->>'${colKey}') != '' AND data->>'${colKey}' ~ '^-?[0-9,]+\\.?[0-9]*$' THEN 1 ELSE 0 END) AS "${colAlias}_type_match"`
           );
-          // 숫자 통계
+          // 숫자 통계 (숫자 정규식 필터 + DOUBLE PRECISION으로 오버플로 방지)
+          const numFilter = `data->>'${colKey}' IS NOT NULL AND TRIM(data->>'${colKey}') != '' AND REGEXP_REPLACE(TRIM(data->>'${colKey}'), ',', '', 'g') ~ '^-?[0-9]+\\.?[0-9]*$'`;
+          const numCast = `CAST(REGEXP_REPLACE(TRIM(data->>'${colKey}'), ',', '', 'g') AS DOUBLE PRECISION)`;
           selectParts.push(
-            `MIN(CAST(NULLIF(REGEXP_REPLACE(TRIM(data->>'${colKey}'), ',', '', 'g'), '') AS NUMERIC)) AS "${colAlias}_min"`
+            `MIN(CASE WHEN ${numFilter} THEN ${numCast} END) AS "${colAlias}_min"`
           );
           selectParts.push(
-            `MAX(CAST(NULLIF(REGEXP_REPLACE(TRIM(data->>'${colKey}'), ',', '', 'g'), '') AS NUMERIC)) AS "${colAlias}_max"`
+            `MAX(CASE WHEN ${numFilter} THEN ${numCast} END) AS "${colAlias}_max"`
           );
           selectParts.push(
-            `AVG(CAST(NULLIF(REGEXP_REPLACE(TRIM(data->>'${colKey}'), ',', '', 'g'), '') AS NUMERIC)) AS "${colAlias}_mean"`
+            `AVG(CASE WHEN ${numFilter} THEN ${numCast} END) AS "${colAlias}_mean"`
           );
           selectParts.push(
-            `STDDEV(CAST(NULLIF(REGEXP_REPLACE(TRIM(data->>'${colKey}'), ',', '', 'g'), '') AS NUMERIC)) AS "${colAlias}_stddev"`
+            `STDDEV(CASE WHEN ${numFilter} THEN ${numCast} END) AS "${colAlias}_stddev"`
           );
         } else if (col.type === "date") {
           selectParts.push(
@@ -1356,7 +910,7 @@ Rules:
         const stddev = parseFloat(stats[`${colAlias}_stddev`]);
         if (!isNaN(mean) && !isNaN(stddev) && stddev > 0) {
           const colKey = col.name.replace(/'/g, "''");
-          const outlierQuery = `${sampleCte} SELECT COUNT(*) AS cnt FROM ${tableName} WHERE data->>'${colKey}' IS NOT NULL AND TRIM(data->>'${colKey}') != '' AND data->>'${colKey}' ~ '^-?[0-9,]+\\.?[0-9]*$' AND ABS(CAST(REGEXP_REPLACE(TRIM(data->>'${colKey}'), ',', '', 'g') AS NUMERIC) - ${mean}) > 3 * ${stddev}`;
+          const outlierQuery = `${sampleCte} SELECT COUNT(*) AS cnt FROM ${tableName} WHERE data->>'${colKey}' IS NOT NULL AND TRIM(data->>'${colKey}') != '' AND data->>'${colKey}' ~ '^-?[0-9,]+\\.?[0-9]*$' AND ABS(CAST(REGEXP_REPLACE(TRIM(data->>'${colKey}'), ',', '', 'g') AS DOUBLE PRECISION) - ${mean}) > 3 * ${stddev}`;
           const outlierResult = await db.execute(sql.raw(outlierQuery));
           outlierCounts[col.name] = parseInt((outlierResult as any).rows[0].cnt);
         } else {
@@ -1427,10 +981,30 @@ Rules:
         generatedAt: new Date().toISOString(),
       };
 
-      res.json(report);
-    } catch (err) {
+      // 리포트를 캐시에 저장 (다음 요청부터 즉시 반환)
+      const dqvResult = await db
+        .select()
+        .from(datasetQualityMetrics)
+        .where(eq(datasetQualityMetrics.datasetId, id))
+        .limit(1);
+
+      if (dqvResult.length > 0) {
+        await db
+          .update(datasetQualityMetrics)
+          .set({ reportCache: report })
+          .where(eq(datasetQualityMetrics.datasetId, id));
+        res.json({ ...report, dcatMetadata: dqvResult[0].dcatMetadata });
+      } else {
+        res.json(report);
+      }
+    } catch (err: any) {
       console.error("Quality report error:", err);
-      res.status(500).json({ message: "Failed to generate quality report" });
+      res.status(500).json({
+        message: "Failed to generate quality report",
+        detail: err?.message || String(err),
+        hint: err?.hint,
+        position: err?.position,
+      });
     }
   });
 
@@ -1548,6 +1122,13 @@ Rules:
         }
       }
 
+      // DCAT 3.0 DQV 품질 분석 비동기 트리거 (정형 데이터만)
+      if (dataType === "structured") {
+        qualityService.computeQualityMetrics(newDataset.id).catch((err) =>
+          console.error("[DQV] 품질 분석 실패:", err),
+        );
+      }
+
       res.json({
         message: "Dataset uploaded successfully",
         dataset: newDataset,
@@ -1584,6 +1165,170 @@ Rules:
     } catch (err) {
       console.error("Update dataset error:", err);
       res.status(500).json({ message: "Failed to update dataset" });
+    }
+  });
+
+  // Update dataset column semantic roles
+  const SEMANTIC_ROLES: SemanticRole[] = ["metric", "dimension", "date", "id", "boolean"];
+  function isSemanticRole(value: unknown): value is SemanticRole {
+    return typeof value === "string" && SEMANTIC_ROLES.includes(value as SemanticRole);
+  }
+
+  app.put("/api/datasets/:id/columns", async (req, res) => {
+    try {
+      const id = Number(req.params.id);
+      const { columns } = req.body as {
+        columns?: Array<{ name?: string; semanticRole?: unknown }>;
+      };
+
+      if (!Array.isArray(columns)) {
+        return res.status(400).json({ message: "컬럼 정보가 필요합니다." });
+      }
+
+      const [dataset] = await db
+        .select()
+        .from(datasets)
+        .where(eq(datasets.id, id))
+        .limit(1);
+
+      if (!dataset || !dataset.columnInfo) {
+        return res.status(404).json({ message: "Dataset not found" });
+      }
+
+      const currentColumns: ColumnInfo[] =
+        typeof dataset.columnInfo === "string"
+          ? JSON.parse(dataset.columnInfo)
+          : dataset.columnInfo || [];
+
+      const updatesByName = new Map(
+        columns
+          .filter((c) => c.name)
+          .map((c) => [c.name, c])
+      );
+
+      const nextColumns = currentColumns.map((col) => {
+        const update = updatesByName.get(col.name);
+        if (!update) return col;
+        return {
+          ...col,
+          semanticRole: isSemanticRole(update.semanticRole)
+            ? update.semanticRole
+            : undefined,
+        };
+      });
+
+      const [updated] = await db
+        .update(datasets)
+        .set({
+          columnInfo: JSON.stringify(nextColumns),
+          updatedAt: new Date(),
+        })
+        .where(eq(datasets.id, id))
+        .returning();
+
+      schemaCache.delete(String(id));
+
+      res.json(updated);
+    } catch (err) {
+      console.error("Update dataset columns error:", err);
+      res.status(500).json({ message: "컬럼 타입 저장에 실패했습니다." });
+    }
+  });
+
+  // LLM 기반 SQL 검증
+  app.post("/api/sql-validate", async (req, res) => {
+    try {
+      const input = sqlValidateInputSchema.parse(req.body);
+
+      const systemPrompt = `너는 SQL 검증 전문가다. 아래 기준으로 SQL을 검사하고 반드시 JSON만 출력하라.
+판정 기준:
+- pass: 질문 의도와 SQL이 일치하고 실행 오류 없음
+- warn: 실행은 되지만 질문 의도와 다소 다르거나, 결과가 0행이거나, 비효율적
+- fail: 실행 오류 있거나 질문과 완전히 다른 SQL
+
+출력 형식 (JSON만, 설명 없음):
+{"verdict": "pass"|"warn"|"fail", "summary": "한 문장 판정 이유", "checks": ["항목1", "항목2"]}`;
+
+      const userPrompt = `질문: ${input.userQuestion}
+SQL: ${input.sql}
+실행 오류: ${input.executionError || "없음"}
+결과 행 수: ${input.resultRowCount ?? "미확인"}`;
+
+      const raw = await generateTextForValidation({
+        systemPrompt,
+        userPrompt,
+        temperature: 0,
+        maxTokens: 350,
+      });
+
+      const jsonMatch = raw.match(/\{[\s\S]*\}/);
+      if (!jsonMatch) {
+        return res.status(500).json({ message: "검증 모델 응답에서 JSON을 추출할 수 없습니다." });
+      }
+
+      const parsed = sqlValidateOutputSchema.parse(JSON.parse(jsonMatch[0]));
+      res.json(parsed);
+    } catch (err) {
+      console.error("SQL validate error:", err);
+      res.status(500).json({ message: "SQL 검증에 실패했습니다." });
+    }
+  });
+
+  // AI 인사이트 생성 (3단계 멀티모델 파이프라인)
+  app.post("/api/insight", async (req, res) => {
+    try {
+      const { systemPrompt, userPrompt } = insightInputSchema.parse(req.body);
+
+      // 1단계: PRIMARY 초안 + VALIDATION 보완 (병렬)
+      const [primaryDraft, complementResult] = await Promise.all([
+        generateTextPrimary({
+          systemPrompt,
+          userPrompt,
+          temperature: 0.2,
+          maxTokens: 900,
+        }),
+        generateTextForValidation({
+          systemPrompt:
+            "너는 데이터 분석 보조자다. 다른 분석가의 결과를 보완하는 짧은 추가 관점만 제시한다. 중복 설명 금지. bullet point만 사용.",
+          userPrompt: `${userPrompt}\n\n위 데이터를 보고 주요 분석가가 놓치기 쉬운 관점이나 주의사항을 3가지 이내로 간결하게 제시하라.`,
+          temperature: 0.3,
+          maxTokens: 180,
+        }).catch(() => null),
+      ]);
+
+      // 2단계: 보완이 있으면 SYNTHESIS로 통합, 없으면 초안 그대로
+      let finalInsight = primaryDraft;
+
+      if (complementResult) {
+        try {
+          finalInsight = await generateTextForSynthesis({
+            systemPrompt:
+              "너는 데이터 분석 통합 전문가다. 두 분석 결과를 하나로 통합하되, 출처를 언급하지 않고 자연스럽게 합쳐라.",
+            userPrompt: `아래 두 분석을 통합해 최종 인사이트를 작성해라.
+
+[주요 분석]
+${primaryDraft}
+
+[보완 관점]
+${complementResult}
+
+규칙:
+- [주요 분석]의 구조([사용된 주요 컬럼] / [핵심 관찰] / [결론 및 시사점] / [주의 사항])를 그대로 유지할 것
+- [보완 관점]에서 가치 있는 내용만 자연스럽게 통합하되 중복 제거
+- 새로운 추측이나 데이터 외부 지식 추가 금지
+- 분석 출처(어느 모델인지)는 언급하지 말 것`,
+            temperature: 0.2,
+            maxTokens: 900,
+          });
+        } catch {
+          // SYNTHESIS 실패 시 PRIMARY 초안 사용
+        }
+      }
+
+      res.json({ insight: finalInsight });
+    } catch (err) {
+      console.error("Insight generation error:", err);
+      res.status(500).json({ message: "인사이트 생성에 실패했습니다." });
     }
   });
 

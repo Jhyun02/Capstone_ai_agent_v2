@@ -75,7 +75,7 @@ SESSION_SECRET=...                          # 32+ chars
 AI_INTEGRATIONS_OPENROUTER_API_KEY=...      # Optional; falls back to Ollama
 AI_INTEGRATIONS_OPENROUTER_BASE_URL=...
 NODE_ENV=development|production
-PORT=5000                                   # Default; Replit maps to 80 externally
+PORT=3000                                   # Default
 ```
 
 ## SQL Constraints (enforced via LLM prompt)

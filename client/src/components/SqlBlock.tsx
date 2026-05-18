@@ -1,13 +1,15 @@
-import { Check, Copy, CheckCircle2, XCircle, ShieldCheck, ShieldAlert } from "lucide-react";
+import { Check, Copy, CheckCircle2, XCircle, ShieldCheck, ShieldAlert, Bot, Loader2 } from "lucide-react";
 import { useState } from "react";
 import type { SqlValidation } from "@shared/routes";
+import type { LlmVerdict } from "@/hooks/use-chat";
 
 interface SqlBlockProps {
   code: string;
   validation?: SqlValidation;
+  llmVerdict?: LlmVerdict | null;
 }
 
-export function SqlBlock({ code, validation }: SqlBlockProps) {
+export function SqlBlock({ code, validation, llmVerdict }: SqlBlockProps) {
   const [copied, setCopied] = useState(false);
 
   const handleCopy = async () => {
@@ -60,6 +62,36 @@ export function SqlBlock({ code, validation }: SqlBlockProps) {
               </div>
             ))}
           </div>
+        </div>
+      )}
+
+      {llmVerdict === undefined ? null : llmVerdict === null ? (
+        <div className="px-4 py-2.5 border-t border-border/50 bg-muted/10 flex items-center gap-2">
+          <Loader2 className="w-3.5 h-3.5 animate-spin text-muted-foreground" />
+          <span className="text-xs text-muted-foreground">AI 검증 중...</span>
+        </div>
+      ) : (
+        <div className="px-4 py-2.5 border-t border-border/50 bg-muted/10">
+          <div className="flex items-center gap-2 mb-1.5">
+            <Bot className="w-3.5 h-3.5" />
+            <span className={`text-xs font-medium px-1.5 py-0.5 rounded ${
+              llmVerdict.verdict === "pass"
+                ? "bg-green-500/10 text-green-600"
+                : llmVerdict.verdict === "warn"
+                  ? "bg-yellow-500/10 text-yellow-600"
+                  : "bg-red-500/10 text-red-600"
+            }`}>
+              {llmVerdict.verdict === "pass" ? "AI 검증 완료" : llmVerdict.verdict === "warn" ? "AI 주의" : "AI 오류 감지"}
+            </span>
+            <span className="text-xs text-muted-foreground">{llmVerdict.summary}</span>
+          </div>
+          {llmVerdict.checks.length > 0 && (
+            <div className="space-y-0.5 ml-5">
+              {llmVerdict.checks.map((check, i) => (
+                <div key={i} className="text-[11px] text-muted-foreground">• {check}</div>
+              ))}
+            </div>
+          )}
         </div>
       )}
     </div>

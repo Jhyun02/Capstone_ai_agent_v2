@@ -16,6 +16,35 @@ export const sqlValidationSchema = z.object({
 export type SqlValidationItem = z.infer<typeof sqlValidationItemSchema>;
 export type SqlValidation = z.infer<typeof sqlValidationSchema>;
 
+export const pipelineLogSchema = z.object({
+  mode: z.enum(["legacy", "enhanced"]),
+  primaryLlm: z.enum(["ollama", "openrouter"]),
+  primarySql: z.string(),
+  primaryLatencyMs: z.number(),
+  schemaValidation: z.object({
+    passed: z.boolean(),
+    failedItems: z.array(z.string()),
+  }),
+  errorClassification: z.string().optional(),
+  fallbackUsed: z.boolean(),
+  fallbackLlm: z.enum(["ollama", "openrouter"]).optional(),
+  fallbackSql: z.string().optional(),
+  fallbackLatencyMs: z.number().optional(),
+  selfCorrectionAttempts: z.number(),
+  selfCorrectionHistory: z.array(z.object({
+    attempt: z.number(),
+    errorType: z.string(),
+    errorMessage: z.string(),
+    correctedSql: z.string(),
+    latencyMs: z.number(),
+  })),
+  finalSql: z.string(),
+  success: z.boolean(),
+  totalLatencyMs: z.number(),
+});
+
+export type PipelineLog = z.infer<typeof pipelineLogSchema>;
+
 export const api = {
   chat: {
     sql: {
@@ -48,3 +77,28 @@ export const api = {
     },
   },
 };
+
+// SQL LLM 검증 스키마
+export const sqlValidateInputSchema = z.object({
+  userQuestion: z.string(),
+  sql: z.string(),
+  executionError: z.string().nullable().optional(),
+  resultRowCount: z.number().int().nonnegative().nullable().optional(),
+});
+
+export const sqlValidateOutputSchema = z.object({
+  verdict: z.enum(["pass", "warn", "fail"]),
+  summary: z.string(),
+  checks: z.array(z.string()),
+});
+
+export type SqlValidateInput = z.infer<typeof sqlValidateInputSchema>;
+export type SqlValidateOutput = z.infer<typeof sqlValidateOutputSchema>;
+
+// 인사이트 생성 스키마
+export const insightInputSchema = z.object({
+  systemPrompt: z.string(),
+  userPrompt: z.string(),
+});
+
+export type InsightInput = z.infer<typeof insightInputSchema>;

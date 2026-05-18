@@ -1,5 +1,8 @@
 import { useMutation } from "@tanstack/react-query";
-import { api, type SqlValidation } from "@shared/routes";
+import { api, type SqlValidation, type SqlValidateOutput } from "@shared/routes";
+import type { ProvenanceInfo } from "@shared/schema";
+
+export type LlmVerdict = SqlValidateOutput;
 
 export type Message = {
   id: string;
@@ -17,6 +20,8 @@ export type Message = {
   }[];
   error?: string;
   validation?: SqlValidation;
+  provenance?: ProvenanceInfo | null;
+  llmVerdict?: LlmVerdict | null;
   timestamp: Date;
 };
 

@@ -1,7 +1,7 @@
-import { MessageSquare, Database, Settings, Menu, BookOpen } from "lucide-react";
+import { MessageSquare, Database, Settings, Menu } from "lucide-react";
 import { Button } from "@/components/ui/button";
 
-export type TabType = 'chat' | 'database' | 'knowledge' | 'settings';
+export type TabType = 'chat' | 'database' | 'settings';
 
 interface TopNavProps {
   activeTab: TabType;
@@ -12,7 +12,6 @@ interface TopNavProps {
 const tabs: { id: TabType; label: string; icon: typeof MessageSquare }[] = [
   { id: 'chat', label: '채팅', icon: MessageSquare },
   { id: 'database', label: '데이터베이스', icon: Database },
-  { id: 'knowledge', label: '지식베이스', icon: BookOpen },
 ];
 
 export function TopNav({ activeTab, onTabChange, onMenuClick }: TopNavProps) {
@@ -32,13 +31,11 @@ export function TopNav({ activeTab, onTabChange, onMenuClick }: TopNavProps) {
           
           <div className="flex flex-col">
             <h1 className="text-base sm:text-xl font-bold text-foreground truncate">
-              {activeTab === 'settings' ? '설정' : activeTab === 'knowledge' ? '지식베이스' : '데이터 코파일럿'}
+              {activeTab === 'settings' ? '설정' : '데이터 코파일럿'}
             </h1>
             <p className="text-[10px] sm:text-xs text-muted-foreground hidden sm:block">
-              {activeTab === 'settings' 
-                ? '모델과 설정을 조정하세요' 
-                : activeTab === 'knowledge'
-                ? '문서를 업로드하고 AI에게 질문하세요'
+              {activeTab === 'settings'
+                ? '모델과 설정을 조정하세요'
                 : '질문하면 SQL과 차트를 바로 만들어 드립니다'}
             </p>
           </div>

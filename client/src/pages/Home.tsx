@@ -1,7 +1,8 @@
-import { useState, useRef, useEffect, useCallback } from "react";
+import { useState, useRef, useEffect, useCallback, useMemo } from "react";
 import { useQuery } from "@tanstack/react-query";
 import { useChat, type Message } from "@/hooks/use-chat";
 import { useChatStream } from "@/hooks/use-chat-stream";
+import { useInsight } from "@/hooks/use-insight";
 import { Sidebar, type Conversation } from "@/components/Sidebar";
 import { TopNav, type TabType } from "@/components/TopNav";
 import { ChatInput } from "@/components/ChatInput";
@@ -11,8 +12,9 @@ import { DataChart, ChartToggle, canShowChart } from "@/components/DataChart";
 import { StepProgress } from "@/components/StepProgress";
 import { SettingsPage } from "@/components/SettingsPage";
 import { DatabasePage } from "@/components/DatabasePage";
-import { KnowledgeBasePage } from "@/components/KnowledgeBasePage";
 import { FileUploadDialog } from "@/components/FileUploadDialog";
+import { ProvenanceFootnote } from "@/components/ProvenanceFootnote";
+import { InsightOverlay } from "@/components/InsightOverlay";
 import { motion, AnimatePresence } from "framer-motion";
 import {
   Filter,
@@ -23,8 +25,12 @@ import {
   Terminal,
   Database,
   BookOpen,
+  Brain,
+  Loader2,
 } from "lucide-react";
-import type { Dataset } from "@shared/schema";
+import type { Dataset, ColumnInfo } from "@shared/schema";
+import { canEnableInference } from "@shared/inference";
+import { extractColumnsFromSql } from "@/lib/insight";
 
 interface SampleQuestionsResponse {
   questions: string[];
@@ -128,9 +134,20 @@ export default function Home() {
             sql: data.sql,
             data: data.data,
             error: (data as any).error,
+            provenance: (data as any).provenance,
             timestamp: new Date(),
           };
           setMessages((prev) => [...prev, responseMessage]);
+
+          if (data.sql?.trim()) {
+            requestLlmValidation(
+              responseMessage.id,
+              message,
+              data.sql,
+              (data as any).error,
+              data.data?.length,
+            );
+          }
         },
         onError: (error) => {
           const errorMessage: Message = {
@@ -167,6 +184,80 @@ export default function Home() {
       if (!res.ok) throw new Error("Failed to fetch datasets");
       return res.json();
     },
+  });
+
+  // 인사이트 활성화 조건 계산
+  const inferenceStatus = useMemo(() => {
+    if (!selectedDatasetId || !datasetsList) {
+      return canEnableInference({
+        recentUniqueQuestionCount: 0,
+        analyzableColumnCount: 0,
+        distinctUsedAnalyzableColumns: 0,
+        datasetRowCount: 0,
+      });
+    }
+
+    const dataset = datasetsList.find((d) => d.id === selectedDatasetId);
+    if (!dataset) {
+      return canEnableInference({
+        recentUniqueQuestionCount: 0,
+        analyzableColumnCount: 0,
+        distinctUsedAnalyzableColumns: 0,
+        datasetRowCount: 0,
+      });
+    }
+
+    const columns: ColumnInfo[] = dataset.columnInfo
+      ? typeof dataset.columnInfo === "string"
+        ? JSON.parse(dataset.columnInfo)
+        : dataset.columnInfo
+      : [];
+
+    const analyzableColumns = columns.filter((c) => c.type === "number");
+    const analyzableColumnNames = analyzableColumns.map((c) => c.name);
+
+    const sqlMessages = messages.filter((m) => m.role === "assistant" && m.sql?.trim());
+    const uniqueSqls = new Set(sqlMessages.map((m) => m.sql));
+
+    const usedColumns = new Set<string>();
+    for (const msg of sqlMessages) {
+      for (const col of extractColumnsFromSql(msg.sql || "")) {
+        if (analyzableColumnNames.includes(col)) usedColumns.add(col);
+      }
+    }
+
+    return canEnableInference({
+      recentUniqueQuestionCount: uniqueSqls.size,
+      analyzableColumnCount: analyzableColumns.length,
+      distinctUsedAnalyzableColumns: usedColumns.size,
+      datasetRowCount: dataset.rowCount,
+    });
+  }, [selectedDatasetId, datasetsList, messages]);
+
+  const usedAnalyzableColumnsList = useMemo(() => {
+    if (!selectedDatasetId || !datasetsList) return [];
+    const dataset = datasetsList.find((d) => d.id === selectedDatasetId);
+    if (!dataset?.columnInfo) return [];
+    const columns: ColumnInfo[] =
+      typeof dataset.columnInfo === "string"
+        ? JSON.parse(dataset.columnInfo)
+        : dataset.columnInfo;
+    const analyzableNames = columns.filter((c) => c.type === "number").map((c) => c.name);
+    const sqlMessages = messages.filter((m) => m.role === "assistant" && m.sql?.trim());
+    const used = new Set<string>();
+    for (const msg of sqlMessages) {
+      for (const col of extractColumnsFromSql(msg.sql || "")) {
+        if (analyzableNames.includes(col)) used.add(col);
+      }
+    }
+    return Array.from(used);
+  }, [selectedDatasetId, datasetsList, messages]);
+
+  const insight = useInsight({
+    messages,
+    usedAnalyzableColumnsList,
+    enabled: inferenceStatus.enabled,
+    reliabilityWarning: inferenceStatus.reliabilityWarning,
   });
 
   const makeWelcomeMessage = (): Message => ({
@@ -351,10 +442,33 @@ export default function Home() {
     setActiveTab("chat");
   }
 
+  const requestLlmValidation = useCallback((msgId: string, userQuestion: string, sqlText: string, error: string | undefined, rowCount: number | undefined) => {
+    fetch("/api/sql-validate", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        userQuestion,
+        sql: sqlText,
+        executionError: error || null,
+        resultRowCount: rowCount ?? null,
+      }),
+    })
+      .then((res) => (res.ok ? res.json() : null))
+      .then((verdict) => {
+        if (verdict) {
+          setMessages((prev) =>
+            prev.map((m) => (m.id === msgId ? { ...m, llmVerdict: verdict } : m))
+          );
+        }
+      })
+      .catch(() => {});
+  }, []);
+
   // 스트리밍 완료 시 메시지로 변환하여 대화 기록에 저장
   const prevStreamStep = useRef(stream.currentStep);
   useEffect(() => {
     if (prevStreamStep.current !== "done" && stream.currentStep === "done") {
+      const hasSql = !!stream.sql?.trim();
       const responseMessage: Message = {
         id: crypto.randomUUID(),
         role: "assistant",
@@ -363,10 +477,24 @@ export default function Home() {
         data: stream.data,
         sources: stream.sources,
         validation: stream.validation,
+        provenance: stream.provenance,
+        llmVerdict: hasSql ? null : undefined,
         timestamp: new Date(),
       };
 
       setMessages((prev) => [...prev, responseMessage]);
+
+      if (hasSql) {
+        const lastUserMsg = messages.filter((m) => m.role === "user").pop();
+        requestLlmValidation(
+          responseMessage.id,
+          lastUserMsg?.content || "",
+          stream.sql,
+          undefined,
+          stream.data?.length,
+        );
+      }
+
       stream.reset();
     }
     prevStreamStep.current = stream.currentStep;
@@ -575,7 +703,7 @@ export default function Home() {
                           animate={{ opacity: 1, height: "auto" }}
                           className="w-full"
                         >
-                          <SqlBlock code={msg.sql} validation={msg.validation} />
+                          <SqlBlock code={msg.sql} validation={msg.validation} llmVerdict={msg.llmVerdict} />
                         </motion.div>
                       )}
 
@@ -609,6 +737,9 @@ export default function Home() {
                               <DataChart data={msg.data || []} />
                             )}
                           <DataTable data={msg.data} />
+                          {msg.provenance && (
+                            <ProvenanceFootnote provenance={msg.provenance} />
+                          )}
                         </motion.div>
                       )}
 
@@ -703,6 +834,9 @@ export default function Home() {
                   >
                     {canShowChart(stream.data) && <DataChart data={stream.data} />}
                     <DataTable data={stream.data} />
+                    {stream.provenance && (
+                      <ProvenanceFootnote provenance={stream.provenance} />
+                    )}
                   </motion.div>
                 )}
 
@@ -890,10 +1024,36 @@ export default function Home() {
                 </option>
               ))}
             </select>
+
+            <button
+              onClick={insight.requestInsight}
+              disabled={!inferenceStatus.enabled || insight.isLoading}
+              title={inferenceStatus.enabled ? "대화 기반 인사이트 생성" : inferenceStatus.notice}
+              className={`flex items-center gap-1 px-2.5 py-1 rounded-md text-xs font-medium transition-all ${
+                inferenceStatus.enabled && !insight.isLoading
+                  ? "bg-violet-500/10 text-violet-600 hover:bg-violet-500/20 border border-violet-500/30"
+                  : "bg-muted text-muted-foreground cursor-not-allowed"
+              }`}
+            >
+              {insight.isLoading ? (
+                <Loader2 className="w-3 h-3 animate-spin" />
+              ) : (
+                <Brain className="w-3 h-3" />
+              )}
+              {insight.isLoading ? "분석 중..." : "인사이트"}
+            </button>
           </div>
         </div>
         <ChatInput onSend={handleSend} isLoading={chatMutation.isPending || stream.isStreaming} />
       </div>
+
+      <InsightOverlay
+        isOpen={insight.isOpen}
+        isLoading={insight.isLoading}
+        elapsedSeconds={insight.elapsedSeconds}
+        result={insight.result}
+        onClose={insight.close}
+      />
     </div>
   );
 
@@ -903,11 +1063,21 @@ export default function Home() {
         return renderChatContent();
       case "database":
         return <DatabasePage refreshKey={datasetRefreshKey} />;
-      case "knowledge":
-        return <KnowledgeBasePage />;
       case "settings":
         return (
-          <SettingsPage settings={settings} onSettingsChange={setSettings} />
+          <SettingsPage
+            settings={settings}
+            onSettingsChange={setSettings}
+            conversationCount={conversations.length}
+            messageCount={Object.values(conversationMessages).reduce((sum, msgs) => sum + msgs.length, 0)}
+            onClearAllConversations={() => {
+              setConversations([]);
+              setConversationMessages({});
+              setConversationDatasets({});
+              localStorage.removeItem(STORAGE_KEY);
+              createNewConversation();
+            }}
+          />
         );
       default:
         return renderChatContent();

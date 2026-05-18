@@ -1,5 +1,6 @@
 import { useState, useCallback, useRef } from "react";
 import type { SqlValidation } from "@shared/routes";
+import type { ProvenanceInfo } from "@shared/schema";
 
 export type StreamStep = "classifying" | "generating_sql" | "executing_sql"
   | "searching_docs" | "synthesizing" | "visualizing" | "idle" | "done" | "error";
@@ -23,6 +24,7 @@ export interface StreamState {
   mode?: "sql_only" | "rag_only" | "hybrid";
   answer?: string;
   validation?: SqlValidation;
+  provenance?: ProvenanceInfo | null;
 }
 
 const initialState: StreamState = {
@@ -37,6 +39,7 @@ const initialState: StreamState = {
   mode: undefined,
   answer: undefined,
   validation: undefined,
+  provenance: undefined,
 };
 
 interface UseChatStreamOptions {
@@ -183,6 +186,7 @@ export function useChatStream({ onFallback }: UseChatStreamOptions) {
                   sql: parsed.sql || prev.sql,
                   data: parsed.data || prev.data,
                   validation: parsed.validation || prev.validation,
+                  provenance: parsed.provenance ?? prev.provenance,
                 }));
                 break;
 

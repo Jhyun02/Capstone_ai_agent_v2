@@ -187,11 +187,14 @@ export interface DatasetUploadRequest {
   description?: string;
 }
 
+export type SemanticRole = "metric" | "dimension" | "date" | "id" | "boolean";
+
 export interface ColumnInfo {
   name: string;
   type: "text" | "number" | "date" | "boolean";
   nullable: boolean;
   sampleValues: string[];
+  semanticRole?: SemanticRole;
 }
 
 // === 데이터 품질 리포트 타입 ===
@@ -226,6 +229,80 @@ export interface QualityReport {
   overallScore: number;        // 0-100
   columns: QualityReportColumn[];
   generatedAt: string;
+}
+
+// === DCAT 3.0 DQV 데이터 품질 메트릭 ===
+
+export const datasetQualityMetrics = pgTable("dataset_quality_metrics", {
+  id: serial("id").primaryKey(),
+  datasetId: integer("dataset_id")
+    .references(() => datasets.id, { onDelete: "cascade" })
+    .notNull()
+    .unique(),
+  completeness: numeric("completeness").notNull(),    // 완전성 (0-100)
+  consistency: numeric("consistency").notNull(),       // 일관성 (0-100)
+  validity: numeric("validity").notNull(),             // 유효성 (0-100)
+  timeliness: numeric("timeliness"),                   // 적시성 (0-100, 날짜 컬럼 없으면 null)
+  overallScore: numeric("overall_score").notNull(),    // 종합 점수 (가중 평균)
+  columnMetrics: jsonb("column_metrics").notNull(),    // DcatColumnMetric[]
+  dcatMetadata: jsonb("dcat_metadata").notNull(),      // DCAT 3.0 DQV JSON-LD
+  qualityWarnings: text("quality_warnings"),           // LLM 프롬프트용 경고 요약
+  reportCache: jsonb("report_cache"),                  // QualityReport 전체 캐시
+  measuredAt: timestamp("measured_at").defaultNow().notNull(),
+});
+
+export const datasetQualityMetricsRelations = relations(
+  datasetQualityMetrics,
+  ({ one }) => ({
+    dataset: one(datasets, {
+      fields: [datasetQualityMetrics.datasetId],
+      references: [datasets.id],
+    }),
+  }),
+);
+
+export const insertDatasetQualityMetricsSchema = createInsertSchema(
+  datasetQualityMetrics,
+).omit({ id: true });
+
+export type DatasetQualityMetrics = typeof datasetQualityMetrics.$inferSelect;
+
+// DCAT 3.0 DQV 컬럼별 품질 메트릭
+export interface DcatColumnMetric {
+  name: string;
+  type: "text" | "number" | "date" | "boolean";
+  completeness: number;      // 완전성 (0-100)
+  typeConsistency: number;   // 타입 일치율 (0-100)
+  validity: number;          // 유효성 (0-100)
+  nullRatio: number;         // null 비율 (0-1)
+  outlierCount?: number;
+  warnings: string[];
+}
+
+// DCAT 3.0 DQV JSON-LD 메타데이터
+export interface DcatQualityMetadata {
+  "@context": {
+    dqv: "http://www.w3.org/ns/dqv#";
+    dcat: "http://www.w3.org/ns/dcat#";
+  };
+  "@type": "dqv:QualityMeasurement";
+  dimensions: {
+    completeness: { value: number; metric: "dqv:completenessMetric" };
+    consistency: { value: number; metric: "dqv:consistencyMetric" };
+    validity: { value: number; metric: "dqv:validityMetric" };
+    timeliness?: { value: number; metric: "dqv:timelinessMetric" };
+  };
+  overallScore: number;
+  measuredAt: string;
+}
+
+// 출처 각주 (Provenance) 타입
+export interface ProvenanceInfo {
+  datasetName: string;
+  rowCount: number;
+  qualityScore: number;
+  measuredAt: string;
+  warnings: string[];
 }
 
 // === KNOWLEDGE BASE (RAG) ===

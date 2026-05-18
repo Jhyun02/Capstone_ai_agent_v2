@@ -1,10 +1,11 @@
-import { useState } from "react";
+import { useState, useEffect } from "react";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
-import { Database, Table, Loader2, Info, FileSpreadsheet, Trash2, Eye, ChevronLeft, ChevronRight, FileText, BarChart3 } from "lucide-react";
+import { Database, Table, Loader2, Info, FileSpreadsheet, Trash2, Eye, ChevronLeft, ChevronRight, FileText, BarChart3, AlertTriangle, Save, Tags } from "lucide-react";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import { Badge } from "@/components/ui/badge";
+import { Progress } from "@/components/ui/progress";
 import { useToast } from "@/hooks/use-toast";
 import {
   Dialog,
@@ -25,10 +26,24 @@ import {
 } from "@/components/ui/alert-dialog";
 import { QualityReportDialog } from "./QualityReportDialog";
 
+type SemanticRoleValue = "auto" | "metric" | "dimension" | "date" | "id" | "boolean";
+
+const SEMANTIC_ROLE_LABELS: Record<SemanticRoleValue, string> = {
+  auto: "자동 추론",
+  metric: "수치 지표",
+  dimension: "분류 기준",
+  date: "날짜/시간",
+  id: "식별자",
+  boolean: "참/거짓",
+};
+
 interface ColumnInfo {
   name: string;
   type: string;
-  description: string;
+  description?: string;
+  nullable?: boolean;
+  sampleValues?: string[];
+  semanticRole?: string;
 }
 
 interface TableInfo {
@@ -61,6 +76,91 @@ interface DatasetDataResponse {
   };
 }
 
+interface QualityMetrics {
+  overallScore: number;
+  completeness: number;
+  consistency: number;
+  validity: number;
+  timeliness: number | null;
+  warnings: string[];
+  measuredAt: string | null;
+}
+
+function getScoreColor(score: number) {
+  if (score >= 80) return "text-green-600";
+  if (score >= 60) return "text-yellow-600";
+  return "text-red-600";
+}
+
+function getScoreBgVariant(score: number): "default" | "secondary" | "destructive" {
+  if (score >= 80) return "default";
+  if (score >= 60) return "secondary";
+  return "destructive";
+}
+
+function QualityOverview({ datasetId }: { datasetId: number }) {
+  const { data: metrics } = useQuery<QualityMetrics | null>({
+    queryKey: ["/api/datasets", datasetId, "quality-metrics"],
+    queryFn: async () => {
+      const res = await fetch(`/api/datasets/${datasetId}/quality-metrics`);
+      if (!res.ok) return null;
+      return res.json();
+    },
+    staleTime: 60_000,
+  });
+
+  if (!metrics) return null;
+
+  const dimensions = [
+    { label: "완전성", value: metrics.completeness },
+    { label: "일관성", value: metrics.consistency },
+    { label: "유효성", value: metrics.validity },
+    ...(metrics.timeliness !== null ? [{ label: "적시성", value: metrics.timeliness }] : []),
+  ];
+
+  return (
+    <div className="space-y-2">
+      <div className="grid grid-cols-2 sm:grid-cols-4 gap-2">
+        {dimensions.map((d) => (
+          <div key={d.label} className="space-y-1">
+            <div className="flex items-center justify-between text-[10px]">
+              <span className="text-muted-foreground">{d.label}</span>
+              <span className={getScoreColor(d.value)}>{d.value}</span>
+            </div>
+            <Progress value={d.value} className="h-1" />
+          </div>
+        ))}
+      </div>
+      {metrics.warnings.length > 0 && (
+        <div className="flex items-start gap-1 text-[11px] text-yellow-600">
+          <AlertTriangle className="h-3 w-3 mt-0.5 shrink-0" />
+          <span>{metrics.warnings.slice(0, 2).join(" | ")}</span>
+        </div>
+      )}
+    </div>
+  );
+}
+
+function QualityScoreBadge({ datasetId }: { datasetId: number }) {
+  const { data: metrics } = useQuery<QualityMetrics | null>({
+    queryKey: ["/api/datasets", datasetId, "quality-metrics"],
+    queryFn: async () => {
+      const res = await fetch(`/api/datasets/${datasetId}/quality-metrics`);
+      if (!res.ok) return null;
+      return res.json();
+    },
+    staleTime: 60_000,
+  });
+
+  if (!metrics) return null;
+
+  return (
+    <Badge variant={getScoreBgVariant(metrics.overallScore)} className="text-[10px] px-1.5">
+      {metrics.overallScore}점
+    </Badge>
+  );
+}
+
 interface DatabasePageProps {
   refreshKey?: number;
 }
@@ -70,8 +170,61 @@ export function DatabasePage({ refreshKey }: DatabasePageProps) {
   const [deleteDataset, setDeleteDataset] = useState<Dataset | null>(null);
   const [qualityReportDataset, setQualityReportDataset] = useState<Dataset | null>(null);
   const [currentPage, setCurrentPage] = useState(1);
+  const [semanticDraft, setSemanticDraft] = useState<Record<string, SemanticRoleValue>>({});
+  const [isSavingRoles, setIsSavingRoles] = useState(false);
+  const [showColumnSettings, setShowColumnSettings] = useState(false);
   const queryClient = useQueryClient();
   const { toast } = useToast();
+
+  useEffect(() => {
+    if (!viewingDataset) {
+      setSemanticDraft({});
+      setShowColumnSettings(false);
+      return;
+    }
+    const columns: ColumnInfo[] =
+      typeof viewingDataset.columnInfo === "string"
+        ? JSON.parse(viewingDataset.columnInfo || "[]")
+        : viewingDataset.columnInfo || [];
+    setSemanticDraft(
+      Object.fromEntries(
+        columns.map((col) => [col.name, (col.semanticRole as SemanticRoleValue) || "auto"])
+      )
+    );
+  }, [viewingDataset?.id]);
+
+  const saveColumnRoles = async () => {
+    if (!viewingDataset) return;
+    setIsSavingRoles(true);
+    try {
+      const columns: ColumnInfo[] =
+        typeof viewingDataset.columnInfo === "string"
+          ? JSON.parse(viewingDataset.columnInfo || "[]")
+          : viewingDataset.columnInfo || [];
+
+      const res = await fetch(`/api/datasets/${viewingDataset.id}/columns`, {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          columns: columns.map((col) => ({
+            name: col.name,
+            semanticRole: semanticDraft[col.name] === "auto" ? undefined : semanticDraft[col.name],
+          })),
+        }),
+      });
+
+      if (!res.ok) throw new Error("저장 실패");
+
+      const updated = await res.json();
+      setViewingDataset(updated);
+      refetchDatasets();
+      toast({ title: "저장 완료", description: "컬럼 타입이 저장되었습니다." });
+    } catch {
+      toast({ variant: "destructive", title: "저장 실패", description: "컬럼 타입 저장 중 오류가 발생했습니다." });
+    } finally {
+      setIsSavingRoles(false);
+    }
+  };
 
   const { data: tables, isLoading: tablesLoading } = useQuery<TableInfo[]>({
     queryKey: ['/api/tables']
@@ -249,6 +402,9 @@ export function DatabasePage({ refreshKey }: DatabasePageProps) {
                         <Badge variant={dataset.dataType === 'structured' ? 'default' : 'secondary'} className="text-xs">
                           {dataset.dataType === 'structured' ? '정형' : '비정형'}
                         </Badge>
+                        {dataset.dataType === 'structured' && (
+                          <QualityScoreBadge datasetId={dataset.id} />
+                        )}
                       </div>
                       <div className="flex items-center gap-1">
                         <Button
@@ -291,8 +447,8 @@ export function DatabasePage({ refreshKey }: DatabasePageProps) {
                       )}
                     </CardDescription>
                   </CardHeader>
-                  {columns && columns.length > 0 && (
-                    <CardContent>
+                  <CardContent className="space-y-3">
+                    {columns && columns.length > 0 && (
                       <div className="space-y-2">
                         <p className="text-xs text-muted-foreground font-medium mb-2">컬럼 정보</p>
                         <div className="flex flex-wrap gap-2">
@@ -304,6 +460,11 @@ export function DatabasePage({ refreshKey }: DatabasePageProps) {
                                   <span className="text-[10px] px-1 py-0.5 bg-primary/10 text-primary rounded">
                                     {col.type}
                                   </span>
+                                  {col.semanticRole && (
+                                    <span className="text-[10px] px-1 py-0.5 bg-violet-500/10 text-violet-600 rounded">
+                                      {SEMANTIC_ROLE_LABELS[col.semanticRole as SemanticRoleValue] || col.semanticRole}
+                                    </span>
+                                  )}
                                 </div>
                               </TooltipTrigger>
                               <TooltipContent>
@@ -318,8 +479,14 @@ export function DatabasePage({ refreshKey }: DatabasePageProps) {
                           )}
                         </div>
                       </div>
-                    </CardContent>
-                  )}
+                    )}
+                    {dataset.dataType === 'structured' && (
+                      <div className="pt-2 border-t">
+                        <p className="text-xs text-muted-foreground font-medium mb-2">데이터 품질 (DCAT 3.0 DQV)</p>
+                        <QualityOverview datasetId={dataset.id} />
+                      </div>
+                    )}
+                  </CardContent>
                 </Card>
               );
             })
@@ -365,6 +532,75 @@ export function DatabasePage({ refreshKey }: DatabasePageProps) {
               {viewingDataset?.fileName} • {viewingDataset?.rowCount.toLocaleString()}개 행
             </DialogDescription>
           </DialogHeader>
+
+          {viewingDataset?.dataType === 'structured' && viewingDataset.columnInfo && (
+            <div className="border rounded-lg">
+              <button
+                onClick={() => setShowColumnSettings((v) => !v)}
+                className="w-full flex items-center justify-between px-4 py-2.5 text-sm font-medium text-muted-foreground hover:text-foreground transition-colors"
+              >
+                <div className="flex items-center gap-2">
+                  <Tags className="w-4 h-4" />
+                  컬럼 타입 설정
+                </div>
+                <span className="text-xs">{showColumnSettings ? "접기" : "펼치기"}</span>
+              </button>
+              {showColumnSettings && (() => {
+                const cols: ColumnInfo[] =
+                  typeof viewingDataset.columnInfo === "string"
+                    ? JSON.parse(viewingDataset.columnInfo || "[]")
+                    : viewingDataset.columnInfo || [];
+                return (
+                  <div className="border-t px-4 py-3 space-y-3">
+                    <div className="grid gap-2 max-h-[200px] overflow-y-auto">
+                      {cols.map((col) => (
+                        <div key={col.name} className="flex items-center justify-between gap-3">
+                          <div className="flex items-center gap-2 min-w-0">
+                            <span className="text-sm font-medium truncate">{col.name}</span>
+                            <span className="text-[10px] px-1.5 py-0.5 bg-primary/10 text-primary rounded shrink-0">
+                              {col.type}
+                            </span>
+                          </div>
+                          <select
+                            value={semanticDraft[col.name] || "auto"}
+                            onChange={(e) =>
+                              setSemanticDraft((prev) => ({
+                                ...prev,
+                                [col.name]: e.target.value as SemanticRoleValue,
+                              }))
+                            }
+                            className="h-7 text-xs rounded-md border border-input bg-background px-2 py-1 focus:outline-none focus:ring-1 focus:ring-primary shrink-0"
+                          >
+                            {(Object.entries(SEMANTIC_ROLE_LABELS) as [SemanticRoleValue, string][]).map(
+                              ([value, label]) => (
+                                <option key={value} value={value}>
+                                  {label}
+                                </option>
+                              )
+                            )}
+                          </select>
+                        </div>
+                      ))}
+                    </div>
+                    <div className="flex justify-end">
+                      <Button
+                        size="sm"
+                        onClick={saveColumnRoles}
+                        disabled={isSavingRoles}
+                      >
+                        {isSavingRoles ? (
+                          <Loader2 className="w-3 h-3 animate-spin mr-1" />
+                        ) : (
+                          <Save className="w-3 h-3 mr-1" />
+                        )}
+                        컬럼 타입 저장
+                      </Button>
+                    </div>
+                  </div>
+                );
+              })()}
+            </div>
+          )}
 
           <div className="flex-1 overflow-auto">
             {dataLoading ? (

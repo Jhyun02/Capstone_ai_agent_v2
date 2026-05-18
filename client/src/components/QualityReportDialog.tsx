@@ -120,11 +120,18 @@ function ColumnCard({ column }: { column: QualityReportColumn }) {
 }
 
 export function QualityReportDialog({ dataset, onClose }: QualityReportDialogProps) {
-  const { data: report, isLoading } = useQuery<QualityReport>({
+  const { data: report, isLoading, isError } = useQuery<QualityReport>({
     queryKey: ['/api/datasets', dataset?.id, 'quality-report'],
-    queryFn: () => fetch(`/api/datasets/${dataset!.id}/quality-report`).then(r => r.json()),
+    queryFn: async () => {
+      const res = await fetch(`/api/datasets/${dataset!.id}/quality-report`);
+      if (!res.ok) throw new Error("품질 리포트 조회 실패");
+      const data = await res.json();
+      if (!data.columns) throw new Error("유효하지 않은 리포트 데이터");
+      return data;
+    },
     enabled: !!dataset,
     staleTime: 5 * 60 * 1000,
+    retry: 1,
   });
 
   return (
@@ -147,6 +154,11 @@ export function QualityReportDialog({ dataset, onClose }: QualityReportDialogPro
               <Skeleton className="h-24 w-full" />
               <Skeleton className="h-40 w-full" />
               <Skeleton className="h-40 w-full" />
+            </div>
+          ) : isError ? (
+            <div className="flex flex-col items-center justify-center py-8 text-muted-foreground">
+              <p className="text-sm">품질 리포트를 불러오지 못했습니다.</p>
+              <p className="text-xs mt-1">데이터가 아직 처리 중이거나 오류가 발생했습니다.</p>
             </div>
           ) : report ? (
             <>

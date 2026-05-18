@@ -36,8 +36,8 @@ const DEFAULT_RAG_MODELS = [
     enabled: true,
   },
   {
-    id: "mistralai/devstral-2512:free",
-    name: "Mistral Devstral",
+    id: "nvidia/nemotron-3-super-120b-a12b:free",
+    name: "NVIDIA Nemotron 3 Super 120B",
     enabled: true,
   },
 ];
